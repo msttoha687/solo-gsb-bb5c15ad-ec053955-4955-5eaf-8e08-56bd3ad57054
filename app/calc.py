@@ -1370,3 +1370,301 @@ def suggest_posts(
         "reason": None,
         "toleranceMm": TOL_MM,
     }
+
+
+# --------------------------------------------------------------------------
+# 层架抗倾覆试算（Anti-overturning Trial）
+#
+# 沿用当前编辑的架体，按简化的刚体倾覆模型评估水平加速度下的稳定性：
+#
+#   1. 整架重心：每层棚板自重 + 坯件重量作为该层的集中质量，其重心高度取
+#      “各层累计高度”（立柱高度自上而下累加，与侧视图中棚板高度一致），
+#      水平重心取该层棚板几何中心；立柱自重不参与（与载荷模型一致）。
+#   2. 支撑多边形：取*底层非悬空立柱*的落点（落在窑车台面矩形内），重叠
+#      落点先合并，再求平面凸包；凸包面积为 0（少于 3 个非共线落点）时
+#      无法形成有效支撑，明确返回无法评估。
+#   3. 任一层没有有效承托（有效柱为 0，含全悬空 / 无立柱）时，载荷路径
+#      不完整、不能视为一个传到底面的刚性整体，明确返回无法评估。
+#   4. 输入水平加速度分量 ax、ay（单位 g，伪静力），重心投影沿加速度
+#      方向平移 (ax·zcg, ay·zcg)（mm）；判定平移后投影到支撑多边形
+#      边界的带符号最短距离 d：d > ε 稳定；|d| ≤ ε 临界（边界）；
+#      d < −ε 倾覆。ax=ay=0 时即“静重心是否落在支撑多边形内”的评估。
+# --------------------------------------------------------------------------
+# 倾覆判定的临界距离容差（mm）：|d| ≤ 该值视为“恰在边界上（临界）”
+OVERTURN_EPS_MM = 1e-6
+
+
+def _merge_landings(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """把距离 ≤ TOL_MM 的落点按重叠分组合并为一个落点（取组内坐标均值）。"""
+    groups = _overlap_groups([{"x": x, "y": y} for x, y in points])
+    merged: List[Tuple[float, float]] = []
+    grouped: set = set()
+    for g in groups:
+        merged.append(
+            (
+                sum(points[k][0] for k in g) / len(g),
+                sum(points[k][1] for k in g) / len(g),
+            )
+        )
+        grouped.update(g)
+    for k, pt in enumerate(points):
+        if k not in grouped:
+            merged.append(pt)
+    return merged
+
+
+def _convex_hull(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Andrew 单调链凸包（严格凸顶点，剔除共线点），返回逆时针顶点序列。"""
+    pts = sorted(set(points))
+    if len(pts) <= 1:
+        return pts
+
+    def cross(o: Tuple[float, float], a: Tuple[float, float],
+              b: Tuple[float, float]) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[Tuple[float, float]] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper: List[Tuple[float, float]] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def _polygon_area2(hull: List[Tuple[float, float]]) -> float:
+    """凸包有向面积的 2 倍（逆时针为正）。"""
+    s = 0.0
+    m = len(hull)
+    for i in range(m):
+        x1, y1 = hull[i]
+        x2, y2 = hull[(i + 1) % m]
+        s += x1 * y2 - x2 * y1
+    return s
+
+
+def _signed_distance_to_polygon(
+    px: float, py: float, hull: List[Tuple[float, float]]
+) -> float:
+    """点到逆时针凸多边形边界的带符号最短距离：内部为正、外部为负、边上为 0。"""
+    min_signed: Optional[float] = None
+    outside = False
+    m = len(hull)
+    for i in range(m):
+        ax, ay = hull[i]
+        bx, by = hull[(i + 1) % m]
+        ex, ey = bx - ax, by - ay
+        length2 = ex * ex + ey * ey
+        if length2 <= 1e-18:
+            continue
+        # 内部点在每条 CCW 边的左侧：cross ≥ 0
+        cr = ex * (py - ay) - ey * (px - ax)
+        if cr < -1e-9:
+            outside = True
+        t = ((px - ax) * ex + (py - ay) * ey) / length2
+        t = min(1.0, max(0.0, t))
+        dist = math.hypot(px - (ax + t * ex), py - (ay + t * ey))
+        if min_signed is None or dist < min_signed:
+            min_signed = dist
+    if min_signed is None:
+        return 0.0
+    return -min_signed if outside else min_signed
+
+
+def _overturn_invalid(reason: str, ax: float, ay: float) -> Dict[str, Any]:
+    return {
+        "evaluable": False,
+        "reason": reason,
+        "accel": {"x": ax, "y": ay, "magnitude": r2(math.hypot(ax, ay))},
+        "centerOfGravity": None,
+        "supportPolygon": None,
+        "shifted": None,
+        "signedDistance": None,
+        "verdict": "unknown",
+        "criticalAccel": None,
+        "safetyFactor": None,
+        "layers": [],
+    }
+
+
+def overturning(raw_state: Optional[Dict[str, Any]], ax: Any, ay: Any) -> Dict[str, Any]:
+    """层架抗倾覆试算：刚体简化模型，水平加速度下重心平移投影对支撑凸包判稳。
+
+    参数
+    ----
+    raw_state : 当前架体输入（不被修改、不被持久化）
+    ax, ay    : 水平加速度的 x / y 分量（单位 g，伪静力；平移方向与加速度同向）
+
+    无法评估（evaluable=False，给出明确 reason）的情形：
+      * ax/ay 不是有限数值（ValueError，API 层转 400）；
+      * 架体没有任何层；
+      * 任一层没有有效承托（有效柱为 0：全悬空 / 无立柱）；
+      * 全部层重量为 0，整架重心无定义；
+      * 底层非悬空落点合并重叠后不足以形成非零面积凸包（< 3 个非共线落点）。
+
+    可评估时返回整架重心、支撑多边形顶点（逆时针）、平移投影、带符号最短
+    距离、判定（stable / critical / overturn）、当前方向临界加速度与
+    抗倾覆安全系数；只计算、不写盘。
+    """
+    try:
+        fax = float(ax)
+        fay = float(ay)
+    except (TypeError, ValueError):
+        raise ValueError("水平加速度分量 ax / ay 必须是数值（单位 g）")
+    if not math.isfinite(fax) or not math.isfinite(fay):
+        raise ValueError("水平加速度分量 ax / ay 必须是有限数值")
+
+    norm = normalize(raw_state)
+    layers = norm["layers"]
+    n = len(layers)
+    if n == 0:
+        return _overturn_invalid("当前架体没有任何层，无法进行抗倾覆评估", fax, fay)
+
+    # 各层有效（非悬空）立柱数；任一层为 0 → 载荷路径不完整，无法评估
+    unsupported_names: List[str] = []
+    support_rects = [_support_rect_for(norm, i) for i in range(n)]
+    for i, L in enumerate(layers):
+        rect = support_rects[i]
+        if not any(in_rect(p["x"], p["y"], rect) for p in L["posts"]):
+            unsupported_names.append(L["name"])
+    if unsupported_names:
+        return _overturn_invalid(
+            "、".join(unsupported_names)
+            + " 没有有效承托（无立柱或立柱全部悬空），载荷不能传到底面，"
+            "无法按整体刚性架体评估抗倾覆，请先补全各层立柱",
+            fax, fay,
+        )
+
+    # 整架重心：各层累计高度作为该层棚板与坯件的重心高度，棚板中心为水平重心
+    cum_h = 0.0
+    sw = 0.0
+    sx = sy = sz = 0.0
+    layer_rows: List[Dict[str, Any]] = []
+    for i, L in enumerate(layers):
+        cum_h += L["height"]
+        b = L["board"]
+        w = b["weight"] + L["wareWeight"]
+        cx = b["x"] + b["w"] / 2.0
+        cy = b["y"] + b["d"] / 2.0
+        cz = cum_h
+        sw += w
+        sx += w * cx
+        sy += w * cy
+        sz += w * cz
+        layer_rows.append(
+            {
+                "index": i,
+                "name": L["name"],
+                "weight": r2(w),
+                "boardWeight": r2(b["weight"]),
+                "wareWeight": r2(L["wareWeight"]),
+                "cgX": r2(cx),
+                "cgY": r2(cy),
+                "cgZ": r2(cz),
+            }
+        )
+    if sw <= 0.0:
+        return _overturn_invalid(
+            "各层棚板自重与坯件重量合计为 0，整架重心无定义，无法评估抗倾覆",
+            fax, fay,
+        )
+
+    cg_x, cg_y, cg_z = sx / sw, sy / sw, sz / sw
+
+    # 支撑多边形：底层非悬空立柱落点（重叠落点合并）的凸包
+    rect0 = support_rects[0]
+    raw_landings = [
+        (p["x"], p["y"])
+        for p in layers[0]["posts"]
+        if in_rect(p["x"], p["y"], rect0)
+    ]
+    landings = _merge_landings(raw_landings)
+    hull = _convex_hull(landings)
+    area2 = abs(_polygon_area2(hull)) if len(hull) >= 3 else 0.0
+    if area2 <= 1e-9:
+        reason = (
+            f"底层非悬空立柱落点仅 {len(landings)} 个（已合并重叠落点），"
+            "全部共线或重合，支撑多边形面积为 0，无法评估抗倾覆；"
+            "请在底层布置至少 3 个非共线、落在窑车台面内的立柱"
+            if len(landings) < 3
+            else "底层非悬空立柱落点全部共线，支撑多边形面积为 0，"
+                 "无法评估抗倾覆；请错开底层立柱布置使其不共线"
+        )
+        return _overturn_invalid(reason, fax, fay)
+
+    # 水平加速度（g）下重心投影平移 ax·zcg / ay·zcg（mm；g 以 1 g 为单位）
+    dx, dy = fax * cg_z, fay * cg_z
+    sh_x, sh_y = cg_x + dx, cg_y + dy
+    dist = _signed_distance_to_polygon(sh_x, sh_y, hull)
+    if dist > OVERTURN_EPS_MM:
+        verdict = "stable"
+    elif dist < -OVERTURN_EPS_MM:
+        verdict = "overturn"
+    else:
+        verdict = "critical"
+
+    # 当前加速度方向上的临界加速度（g）：沿射线 (cg + a·zcg·n) 首次到达边界
+    mag = math.hypot(fax, fay)
+    if mag > 0.0:
+        nx, ny = fax / mag, fay / mag  # 单位方向
+        tol_dist = _ray_exit_tolerance(cg_x, cg_y, cg_z, nx, ny, hull)
+        critical = None if tol_dist is None else r2(tol_dist)
+        factor = None if tol_dist is None else round(tol_dist / mag, 4)
+    else:
+        critical = None
+        factor = None
+
+    return {
+        "evaluable": True,
+        "reason": None,
+        "accel": {"x": fax, "y": fay, "magnitude": r2(mag)},
+        "centerOfGravity": {
+            "x": r2(cg_x), "y": r2(cg_y), "z": r2(cg_z), "weight": r2(sw),
+        },
+        "supportPolygon": {
+            "vertices": [{"x": r2(x), "y": r2(y)} for x, y in hull],
+            "area": r2(area2 / 2.0),
+            "landingCount": len(landings),
+            "rawLandingCount": len(raw_landings),
+        },
+        "shifted": {
+            "x": r2(sh_x), "y": r2(sh_y),
+            "dx": r2(dx), "dy": r2(dy),
+        },
+        "signedDistance": r2(dist),
+        "verdict": verdict,
+        "criticalAccel": critical,      # 沿当前输入方向到达边界的合加速度 g
+        "safetyFactor": factor,         # 临界合加速度 / 当前合加速度
+        "layers": layer_rows,
+    }
+
+
+def _ray_exit_tolerance(
+    cg_x: float, cg_y: float, cg_z: float,
+    nx: float, ny: float,
+    hull: List[Tuple[float, float]],
+) -> Optional[float]:
+    """沿水平方向 n（单位向量）平移重心投影，首次到达支撑多边形边界的
+    合加速度（g）：对每条凸包边求射线与有向边界线（内侧等式）的交点参数
+    a（mm 平移量 / zcg），取最小的非负解。"""
+    if cg_z <= 1e-12:
+        return None
+    best: Optional[float] = None
+    m = len(hull)
+    for i in range(m):
+        ax, ay = hull[i]
+        bx, by = hull[(i + 1) % m]
+        ex, ey = bx - ax, by - ay
+        # CCW 边内侧条件：ex*(y-ay) - ey*(x-ax) >= 0；
+        # 射线上点 (cg + a·zcg·n)，令其等于 0 解 a
+        denom = ex * ny - ey * nx
+        if abs(denom) <= 1e-15:
+            continue
+        t = (ey * (cg_x - ax) - ex * (cg_y - ay)) / (cg_z * denom)
+        if t >= -1e-9 and (best is None or t < best):
+            best = t
+    return best

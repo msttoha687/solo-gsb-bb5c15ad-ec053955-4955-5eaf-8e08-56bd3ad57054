@@ -8,7 +8,14 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.calc import calculate, load_shed, normalize, simulate, suggest_posts  # noqa: E402
+from app.calc import (  # noqa: E402
+    calculate,
+    load_shed,
+    normalize,
+    overturning,
+    simulate,
+    suggest_posts,
+)
 
 SAMPLE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -793,6 +800,208 @@ class CalcTests(unittest.TestCase):
         before = json.loads(json.dumps(state, ensure_ascii=False))
         load_shed(state)
         self.assertEqual(state, before)
+
+    # ---------------- 层架抗倾覆试算 ----------------
+    def _square_rack(self, heights=(300.0,), ware=100.0, board_w=100.0,
+                     posts=None, board_rect=(0.0, 0.0, 1000.0, 1000.0),
+                     car=(1000.0, 1000.0)):
+        """单板 1000×1000、四角 (100,100)/(900,100)/(100,900)/(900,900) 支撑的架体。"""
+        if posts is None:
+            posts = [
+                {"id": "A", "x": 100, "y": 100, "capacity": 0},
+                {"id": "B", "x": 900, "y": 100, "capacity": 0},
+                {"id": "C", "x": 100, "y": 900, "capacity": 0},
+                {"id": "D", "x": 900, "y": 900, "capacity": 0},
+            ]
+        layers = []
+        for k, h in enumerate(heights):
+            layers.append(
+                {
+                    "name": f"L{k}",
+                    "height": h,
+                    "board": {
+                        "x": board_rect[0], "y": board_rect[1],
+                        "w": board_rect[2], "d": board_rect[3],
+                        "weight": board_w,
+                    },
+                    "wareWeight": ware,
+                    "posts": posts if k == 0 else [
+                        {"id": "T", "x": 500, "y": 500, "capacity": 0}
+                    ],
+                }
+            )
+        return {"car": {"w": car[0], "d": car[1]}, "layers": layers}
+
+    def test_overturn_center_of_gravity_accumulated_heights(self):
+        # 两层：板+坯各 200，累计高度 300、600 → 重心高度 (200*300+200*600)/400 = 450
+        st = self._square_rack(heights=(300.0, 300.0))
+        r = overturning(st, 0, 0)
+        self.assertTrue(r["evaluable"])
+        self.assertEqual(r["centerOfGravity"]["z"], 450.0)
+        self.assertEqual(r["centerOfGravity"]["x"], 500.0)
+        self.assertEqual(r["centerOfGravity"]["y"], 500.0)
+        self.assertEqual(r["centerOfGravity"]["weight"], 400.0)
+        # 逐层重心行：累计高度
+        self.assertEqual([row["cgZ"] for row in r["layers"]], [300.0, 600.0])
+
+    def test_overturn_stable_at_zero_and_shifts_with_accel(self):
+        st = self._square_rack()
+        r = overturning(st, 0, 0)
+        self.assertEqual(r["verdict"], "stable")
+        # 重心 (500,500)，方形凸包边界 x=100 → 内部距离 400
+        self.assertEqual(r["signedDistance"], 400.0)
+        self.assertIsNone(r["criticalAccel"])  # 无加速度方向时不输出临界加速度
+        # 0.5g：平移 0.5*300=150 → 投影 x=650，到边界 250，仍稳定
+        r = overturning(st, 0.5, 0)
+        self.assertEqual(r["shifted"]["dx"], 150.0)
+        self.assertEqual(r["shifted"]["x"], 650.0)
+        self.assertEqual(r["signedDistance"], 250.0)
+        self.assertEqual(r["verdict"], "stable")
+        # 临界合加速度：x 方向边界在 400 mm 外 → 400/300 g；安全系数 1.33/0.5
+        self.assertAlmostEqual(r["criticalAccel"], 400 / 300, places=2)
+        self.assertAlmostEqual(r["safetyFactor"], (400 / 300) / 0.5, places=2)
+
+    def test_overturn_critical_on_boundary(self):
+        st = self._square_rack()
+        r = overturning(st, -4 / 3, 0)  # 平移 -400，投影恰在 x=100 边界
+        self.assertEqual(r["verdict"], "critical")
+        self.assertEqual(r["signedDistance"], 0.0)
+        self.assertEqual(r["shifted"]["x"], 100.0)
+
+    def test_overturn_overturns_beyond_boundary(self):
+        st = self._square_rack()
+        r = overturning(st, 2.0, 0)  # 平移 +600 → x=1100，越过 x=900 边界 200
+        self.assertEqual(r["verdict"], "overturn")
+        self.assertEqual(r["signedDistance"], -200.0)
+        self.assertLess(r["safetyFactor"], 1.0)
+
+    def test_overturn_diagonal_direction(self):
+        # 对角方向：射线先碰到哪条边由临界加速度最小者决定
+        st = self._square_rack()
+        r = overturning(st, 0.5, 0.5)
+        self.assertTrue(r["evaluable"])
+        # 单位方向 (1/√2,1/√2)，到右边/上边均需平移 400 mm
+        # → 临界合加速度 = 400/(300/√2) = 400√2/300
+        self.assertAlmostEqual(r["criticalAccel"], 400 * 2 ** 0.5 / 300, places=2)
+
+    def test_overturn_static_eccentric_cg_outside_hull_is_overturn(self):
+        # 棚板偏置使静重心落在支撑多边形外：ax=ay=0 也判倾覆
+        posts = [
+            {"id": "A", "x": 0, "y": 0, "capacity": 0},
+            {"id": "B", "x": 100, "y": 0, "capacity": 0},
+            {"id": "C", "x": 0, "y": 100, "capacity": 0},
+            {"id": "D", "x": 100, "y": 100, "capacity": 0},
+        ]
+        st = self._square_rack(posts=posts)  # 板中心仍在 (500,500)
+        r = overturning(st, 0, 0)
+        self.assertEqual(r["verdict"], "overturn")
+        self.assertLess(r["signedDistance"], 0.0)
+
+    def test_overturn_hull_uses_non_hanging_bottom_posts_only(self):
+        st = self._square_rack()
+        st["layers"][0]["posts"].append(
+            {"id": "H", "x": 5000, "y": 5000, "capacity": 0}  # 悬空：台面外
+        )
+        r = overturning(st, 0, 0)
+        self.assertTrue(r["evaluable"])
+        self.assertEqual(r["supportPolygon"]["rawLandingCount"], 4)
+        # 凸包仍为四角方形
+        self.assertEqual(len(r["supportPolygon"]["vertices"]), 4)
+
+    def test_overturn_overlapping_landings_merged_for_hull(self):
+        posts = [
+            {"id": "A", "x": 100, "y": 100, "capacity": 0},
+            {"id": "A2", "x": 105, "y": 100, "capacity": 0},  # 距 A 5 ≤ 10 → 合并
+            {"id": "B", "x": 900, "y": 100, "capacity": 0},
+            {"id": "C", "x": 100, "y": 900, "capacity": 0},
+            {"id": "D", "x": 900, "y": 900, "capacity": 0},
+        ]
+        st = self._square_rack(posts=posts)
+        r = overturning(st, 0, 0)
+        self.assertTrue(r["evaluable"])
+        self.assertEqual(r["supportPolygon"]["rawLandingCount"], 5)
+        self.assertEqual(r["supportPolygon"]["landingCount"], 4)
+
+    def test_overturn_degenerate_two_points_cannot_evaluate(self):
+        posts = [
+            {"id": "A", "x": 100, "y": 100, "capacity": 0},
+            {"id": "B", "x": 900, "y": 900, "capacity": 0},
+        ]
+        st = self._square_rack(posts=posts)
+        r = overturning(st, 0.1, 0)
+        self.assertFalse(r["evaluable"])
+        self.assertIsNone(r["supportPolygon"])
+        self.assertIn("支撑多边形", r["reason"])
+
+    def test_overturn_collinear_landings_cannot_evaluate(self):
+        posts = [
+            {"id": "A", "x": 100, "y": 500, "capacity": 0},
+            {"id": "B", "x": 500, "y": 500, "capacity": 0},
+            {"id": "C", "x": 900, "y": 500, "capacity": 0},
+        ]
+        st = self._square_rack(posts=posts)
+        r = overturning(st, 0.1, 0)
+        self.assertFalse(r["evaluable"])
+        self.assertIn("共线", r["reason"])
+
+    def test_overturn_all_bottom_posts_hanging_cannot_evaluate(self):
+        posts = [
+            {"id": "H1", "x": -500, "y": -500, "capacity": 0},
+            {"id": "H2", "x": 5000, "y": 5000, "capacity": 0},
+        ]
+        st = self._square_rack(posts=posts)
+        r = overturning(st, 0.1, 0)
+        self.assertFalse(r["evaluable"])
+        self.assertIn("有效承托", r["reason"])
+
+    def test_overturn_unsupported_upper_layer_cannot_evaluate(self):
+        st = self._square_rack(heights=(300.0, 300.0))
+        # 上层唯一柱悬空（落在下层 1000×1000 棚板之外）
+        st["layers"][1]["posts"] = [
+            {"id": "H", "x": 5000, "y": 5000, "capacity": 0}
+        ]
+        r = overturning(st, 0.1, 0)
+        self.assertFalse(r["evaluable"])
+        self.assertIn("有效承托", r["reason"])
+
+    def test_overturn_empty_rack_and_zero_weight_cannot_evaluate(self):
+        r = overturning({"car": {"w": 1000, "d": 1000}, "layers": []}, 0.1, 0)
+        self.assertFalse(r["evaluable"])
+        self.assertIn("没有任何层", r["reason"])
+
+        st = self._square_rack(ware=0.0, board_w=0.0)
+        r = overturning(st, 0.1, 0)
+        self.assertFalse(r["evaluable"])
+        self.assertIn("重心无定义", r["reason"])
+
+    def test_overturn_invalid_accel_raises(self):
+        st = self._square_rack()
+        with self.assertRaises(ValueError):
+            overturning(st, "x", 0)
+        with self.assertRaises(ValueError):
+            overturning(st, 0, None)
+        with self.assertRaises(ValueError):
+            overturning(st, float("nan"), 0)
+        with self.assertRaises(ValueError):
+            overturning(st, 0, float("inf"))
+
+    def test_overturn_sample_state_is_evaluable(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        r = overturning(state, 0.1, 0.05)
+        self.assertTrue(r["evaluable"], r["reason"])
+        self.assertGreater(r["supportPolygon"]["area"], 0.0)
+        self.assertIn(r["verdict"], ("stable", "critical", "overturn"))
+        # 加速度为 0 时示例架体静重心在支撑多边形内
+        r0 = overturning(state, 0, 0)
+        self.assertEqual(r0["verdict"], "stable")
+        self.assertGreater(r0["signedDistance"], 0.0)
+
+    def test_overturn_does_not_mutate_input(self):
+        st = self._square_rack(heights=(300.0, 300.0))
+        before = json.loads(json.dumps(st, ensure_ascii=False))
+        overturning(st, 0.3, -0.2)
+        self.assertEqual(st, before)
 
 
 if __name__ == "__main__":

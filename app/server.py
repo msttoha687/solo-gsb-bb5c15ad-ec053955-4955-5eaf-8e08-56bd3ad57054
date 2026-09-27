@@ -16,6 +16,11 @@ POST /api/load-shed  减载配额试算：body {"state"(可省)}，只下调各�
                      全部有限容量立柱超载的最小总减载量，按现有整架分摊规则约束并
                      重新整架校验；只计算，不写盘；用户确认后由前端走 PUT /api/state
                      把建议坯件重量正式写入
+POST /api/overturning 层架抗倾覆试算：body {"state"(可省), "ax": 0.1, "ay": 0}，
+                     按各层累计高度/棚板中心求整架重心，取底层非悬空落点凸包为
+                     支撑多边形，重心投影按加速度平移后算到边界的带符号最短距离，
+                     判定稳定/临界/倾覆；落点不足或任一层无有效承托时
+                     evaluable=false；只计算，不写盘
 POST /api/reset      恢复内置示例数据
 """
 
@@ -27,7 +32,7 @@ import tempfile
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from .calc import calculate, load_shed, simulate, suggest_posts
+from .calc import calculate, load_shed, overturning, simulate, suggest_posts
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -150,6 +155,25 @@ def api_load_shed():
     if not isinstance(state, dict):
         state = load_state()
     return jsonify({"ok": True, **load_shed(state)})
+
+
+@app.route("/api/overturning", methods=["POST"])
+def api_overturning():
+    """层架抗倾覆试算：水平加速度下重心平移投影对底层落点凸包判稳。
+
+    只计算，不写盘、不改已保存状态；落点不足 / 任一层无有效承托等情形
+    返回 200 + evaluable=false + reason；ax/ay 非法返回 400。
+    """
+    payload = request.get_json(force=True, silent=True)
+    payload = payload if isinstance(payload, dict) else {}
+    state = payload.get("state")
+    if not isinstance(state, dict):
+        state = load_state()
+    try:
+        result = overturning(state, payload.get("ax", 0.0), payload.get("ay", 0.0))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
 
 
 if __name__ == "__main__":

@@ -331,12 +331,44 @@ ul.sug-issues li.is-removed .itype { color: var(--normal); }
 .sug-table td.down { color: var(--normal); font-size: 11px; }
 .shed-panel tr.target td b { color: var(--normal); }
 
+/* ---------- 层架抗倾覆试算 ---------- */
+.overturn-panel { border-style: dashed; border-color: #1f6f78; }
+.overturn-panel .btn-run { border-color: #3fd6d6; color: #3fd6d6; }
+.overturn-panel .btn-run:hover { background: rgba(63,214,214,0.12); }
+.ot-form {
+  display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px;
+  align-items: end; margin-top: 8px;
+}
+.ot-legend { display: none; color: #3fd6d6; }
+.ot-legend.on { display: inline-flex; }
+.dot.ot-support { background: transparent; border: 1.5px dashed #3fd6d6; border-radius: 0; }
+.dot.ot-cg { background: #7db4ff; }
+.dot.ot-shift { background: var(--normal); }
+.ot-verdict {
+  margin: 8px 0; padding: 9px 12px; border-radius: 8px; font-size: 13px; font-weight: 600;
+  background: var(--panel2); border: 1px solid var(--line);
+}
+.ot-verdict.ot-good { color: var(--normal); border-color: var(--normal); background: rgba(52,192,138,0.10); }
+.ot-verdict.ot-warn { color: var(--warn); border-color: var(--warn); background: rgba(240,176,60,0.10); }
+.ot-verdict.ot-bad { color: var(--error); border-color: var(--error); background: rgba(239,91,107,0.10); }
+.badge.ot-badge-good { color: var(--normal); border-color: var(--normal); }
+.badge.ot-badge-warn { color: var(--warn); border-color: var(--warn); }
+.badge.ot-badge-bad { color: var(--error); border-color: var(--error); }
+.sug-metric.good { border-color: var(--normal); }
+.sug-metric.good b { color: var(--normal); }
+.sug-metric.warn { border-color: var(--warn); }
+.sug-metric.warn b { color: var(--warn); }
+.sug-metric.good small, .sug-metric.warn small { color: var(--muted); }
+b.up2 { color: var(--error); }
+b.down { color: var(--normal); }
+
 @media (max-width: 1200px) {
   .layout { grid-template-columns: 330px 1fr; }
   .views { grid-template-columns: 1fr; }
   .bottom-grid { grid-template-columns: 1fr; }
   .sim-cols { grid-template-columns: 1fr; }
   .suggest-form { grid-template-columns: 1fr 1fr; }
+  .ot-form { grid-template-columns: 1fr 1fr; }
   .sug-metrics { grid-template-columns: 1fr 1fr; }
   .sug-issue-cols { grid-template-columns: 1fr; }
 }

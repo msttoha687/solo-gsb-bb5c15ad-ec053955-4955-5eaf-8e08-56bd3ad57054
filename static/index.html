@@ -61,6 +61,9 @@
               <span><i class="dot hanging"></i>悬空</span>
               <span><i class="dot failed"></i>失效（推演）</span>
               <span id="suggestLegend" class="suggest-legend"><i class="dot suggest"></i>建议新柱（预览）</span>
+              <span id="otLegend" class="ot-legend"><i class="dot ot-support"></i>支撑边界</span>
+              <span id="otCgLegend" class="ot-legend"><i class="dot ot-cg"></i>重心投影</span>
+              <span id="otShiftLegend" class="ot-legend"><i class="dot ot-shift"></i>加速度平移点</span>
             </div>
           </div>
           <canvas id="topView"></canvas>
@@ -140,6 +143,31 @@
           <button id="btnShed" class="btn btn-run" type="button">开始减载试算</button>
         </div>
         <div id="shedOutput"></div>
+      </div>
+
+      <div class="panel overturn-panel">
+        <div class="sim-head">
+          <h2>📐 层架抗倾覆试算 <span id="otStatus" class="badge">未试算</span></h2>
+        </div>
+        <p class="hint">
+          沿用当前架体：以<b>各层累计高度</b>作为棚板与坯件的重心高度、<b>棚板中心</b>作为两者水平重心，
+          按重量求整架重心；取<b>底层非悬空立柱落点</b>（重叠落点合并）的<b>凸包</b>作为支撑多边形。
+          输入水平加速度分量（单位 <b>g</b>），重心投影按「加速度 × 重心高度」平移，计算平移投影到
+          支撑边界的<b>带符号最短距离</b>：<b style="color:var(--normal)">在边界内为稳定</b>、
+          <b style="color:var(--warn)">恰在边界为临界</b>、<b style="color:var(--error)">越界为倾覆</b>。
+          试算<span class="hl">只读、不写盘</span>；底层落点不足以形成非零面积凸包、或任一层无有效承托时
+          明确返回无法评估；继续编辑架体，旧试算立即作废。
+        </p>
+        <div class="ot-form">
+          <label>水平加速度 ax (g，X 向)
+            <input type="number" step="any" id="otAx" value="0.1" />
+          </label>
+          <label>水平加速度 ay (g，Y 向)
+            <input type="number" step="any" id="otAy" value="0" />
+          </label>
+          <button id="btnOverturn" class="btn btn-run" type="button">开始抗倾覆试算</button>
+        </div>
+        <div id="otOutput"></div>
       </div>
 
       <div class="bottom-grid">

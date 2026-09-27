@@ -37,6 +37,16 @@ let shedData = null;           // 最近一次减载试算结果
 let shedSeq = 0;               // 试算请求序号，丢弃过期响应
 let shedAppliedMsg = null;     // 确认减载后的一次性提示
 
+/* ================= 层架抗倾覆试算状态 =================
+ * otData 只来自 POST /api/overturning（或离线兜底），只读、绝不写盘；
+ * 架体一经编辑（含确认加柱/减载写入）或恢复示例，旧试算立即作废。
+ */
+let otData = null;             // 最近一次抗倾覆试算结果
+let otSeq = 0;                 // 试算请求序号，丢弃过期响应
+const OT_SUPPORT_COLOR = "#3fd6d6";
+const OT_CG_COLOR = "#7db4ff";
+const OT_SHIFT_COLORS = { stable: "#34c08a", critical: "#f0b03c", overturn: "#ef5b6b" };
+
 /* ================= 数值/工具 ================= */
 const $ = (sel) => document.querySelector(sel);
 const fmt = (v) => (Math.round(v * 100) / 100).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
@@ -95,7 +105,9 @@ async function recalcAndRender(applyChange) {
   if (applyChange === "suggest") label = "写入新柱并保存中…";
   if (applyChange === "shed") label = "写入建议坯件重量并保存中…";
   setSaveState("saving", label);
-  // 架体一经编辑/写盘，之前的加柱试算与减载试算结果即作废（确认写入的那次除外）
+  // 架体一经编辑/写盘，之前的加柱试算、减载试算与抗倾覆试算结果即作废
+  // （确认写入的那次除外；抗倾覆试算只读，任何写盘都意味着架体已变）
+  invalidateOverturn({ silent: true });
   if (!applyChange) {
     invalidateSuggestions({ silent: true });
     invalidateShed({ silent: true });
@@ -356,6 +368,7 @@ $("#btnReset").addEventListener("click", async () => {
   failedSelection = []; simulation = null; simDiff = null; simSeq++;
   invalidateSuggestions({ silent: true });
   invalidateShed({ silent: true });
+  invalidateOverturn({ silent: true });
   suggestAppliedMsg = null;
   shedAppliedMsg = null;
   renderEditor(); renderResults(); markLayerBadges();
@@ -381,6 +394,7 @@ function renderResults() {
   renderSuggestOptions();
   renderSuggestPanel();
   renderShedPanel();
+  renderOverturnPanel();
 }
 
 function renderTotals() {
@@ -510,6 +524,9 @@ function drawTop() {
     });
   });
 
+  // 抗倾覆支撑多边形：画在棚板之上、立柱之下（避免半透明填充盖住立柱标记）
+  drawOverturnPolygon(ctx, tr);
+
   // 重叠落点（画虚线圆圈强调）
   res.layers.forEach((L) => {
     L.posts.forEach((p) => {
@@ -571,6 +588,7 @@ function drawTop() {
   });
 
   drawSuggestPreview(ctx, tr);
+  drawOverturnMarkers(ctx, tr);
 }
 
 /* 加柱建议预览：在俯视图上叠加建议新柱（金色 ⊕），不改基准数据 */
@@ -1443,6 +1461,222 @@ $("#btnShed").addEventListener("click", runLoadShed);
 $("#btnCancelShed").addEventListener("click", cancelShed);
 $("#btnConfirmShed").addEventListener("click", confirmShed);
 
+/* ================= 层架抗倾覆试算面板 ================= */
+/* 架体发生编辑/写盘/重置：上次抗倾覆试算作废（试算只读，无确认写入动作） */
+function invalidateOverturn(opts) {
+  const wasActive = !!otData;
+  otData = null;
+  otSeq++;
+  if (wasActive || !opts || !opts.silent) renderOverturnPanel();
+}
+
+async function runOverturn() {
+  if (!state) return;
+  const ax = num($("#otAx").value);
+  const ay = num($("#otAy").value);
+  const status = $("#otStatus");
+  status.textContent = "试算中…";
+  status.className = "badge has-sim";
+  const seq = ++otSeq;
+  let data;
+  try {
+    const res = await fetch("/api/overturning", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state, ax, ay }),
+    });
+    data = await res.json().catch(() => null);
+    if (!res.ok) {
+      if (seq !== otSeq) return;
+      otData = null;
+      renderOverturnPanel((data && data.error) || `试算失败（HTTP ${res.status}）`);
+      return;
+    }
+  } catch (e) {
+    data = overturningLocal(state, ax, ay); // 离线兜底：与后端同一套算法
+  }
+  if (seq !== otSeq) return; // 期间已有编辑/重置，丢弃过期响应
+  otData = data;
+  renderOverturnPanel();
+  drawTop();
+}
+
+const OT_VERDICT = {
+  stable: { text: "稳定", cls: "good" },
+  critical: { text: "临界（重心投影恰在支撑边界）", cls: "warn" },
+  overturn: { text: "倾覆（重心投影已越出支撑边界）", cls: "bad" },
+};
+
+function renderOverturnPanel(errText) {
+  const out = $("#otOutput");
+  const status = $("#otStatus");
+  if (!out) return;
+
+  if (errText) {
+    status.textContent = "试算失败";
+    status.className = "badge";
+    out.innerHTML = `<p class="sug-error">⚠ ${escapeHtml(errText)}</p>`;
+    return;
+  }
+  if (!otData) {
+    status.textContent = "未试算";
+    status.className = "badge";
+    out.innerHTML = `<p class="muted" style="margin:8px 0 0">输入水平加速度 ax / ay（单位 g，可为正负；平移方向与加速度同向）后点击「开始抗倾覆试算」。
+      试算只读取当前架体、不会写盘；结果在俯视图叠加支撑多边形（青色）、整架重心投影（蓝色）与加速度平移点，并给出到支撑边界的带符号最短距离、当前方向临界加速度与安全系数。</p>`;
+    return;
+  }
+  if (!otData.evaluable) {
+    status.textContent = "无法评估";
+    status.className = "badge has-error";
+    out.innerHTML = `
+      <p class="sug-error">🚫 无法评估：${escapeHtml(otData.reason || "当前架体不满足抗倾覆试算条件")}</p>
+      <p class="hint" style="margin:4px 0 0">请按上述原因补全架体后重新试算。</p>`;
+    return;
+  }
+
+  const v = OT_VERDICT[otData.verdict] || { text: otData.verdict, cls: "" };
+  status.textContent = v.text;
+  status.className = "badge ot-badge-" + v.cls;
+
+  const cg = otData.centerOfGravity;
+  const sp = otData.supportPolygon;
+  const sh = otData.shifted;
+  const acc = otData.accel;
+  const d = otData.signedDistance;
+  const layerRows = otData.layers.map((L) => `
+    <tr>
+      <td>${escapeHtml(L.name)}</td>
+      <td>${fmt(L.boardWeight)} + ${fmt(L.wareWeight)} = ${fmt(L.weight)}</td>
+      <td>(${fmt(L.cgX)}, ${fmt(L.cgY)})</td>
+      <td><b>${fmt(L.cgZ)}</b></td>
+    </tr>`).join("");
+  const critHtml = otData.criticalAccel == null
+    ? "—（加速度为 0，无方向；可先给定 ax / ay 再求该方向的临界值）"
+    : `<b>${fmt(otData.criticalAccel)}</b> g`;
+  const sfHtml = otData.safetyFactor == null
+    ? "—"
+    : `<b class="${otData.safetyFactor < 1 ? "up2" : "down"}">${fmt(otData.safetyFactor)}</b>`;
+  out.innerHTML = `
+    <div class="ot-verdict ot-${v.cls}">${v.text}</div>
+    <div class="sug-metrics">
+      <div class="sug-metric ${v.cls}"><span>判定</span><b>${v.text}</b><small>边界为临界</small></div>
+      <div class="sug-metric ${d < 0 ? "bad" : ""}"><span>投影到边界带符号距离</span><b>${fmt(d)}</b><small>mm（内正外负）</small></div>
+      <div class="sug-metric"><span>水平加速度</span><b>(${fmt(acc.x)}, ${fmt(acc.y)})</b><small>g，合 ${fmt(acc.magnitude)} g</small></div>
+      <div class="sug-metric"><span>当前方向临界加速度</span><b>${critHtml}</b><small>沿 (ax, ay) 方向</small></div>
+      <div class="sug-metric"><span>抗倾覆安全系数</span>${sfHtml}<small>临界 / 当前（≥1 稳定）</small></div>
+    </div>
+    <div class="sug-summary">
+      <span>整架总重 <b>${fmt(cg.weight)}</b> kg</span>
+      <span>重心 <b>(${fmt(cg.x)}, ${fmt(cg.y)}, ${fmt(cg.z)})</b> mm</span>
+      <span>平移量 <b>(${fmt(sh.dx)}, ${fmt(sh.dy)})</b> mm</span>
+      <span>平移点 <b>(${fmt(sh.x)}, ${fmt(sh.y)})</b></span>
+      <span>支撑落点 <b>${sp.landingCount}</b> 个（原始 ${sp.rawLandingCount}）</span>
+      <span>凸包面积 <b>${fmt(sp.area)}</b> mm²</span>
+    </div>
+    <div class="sug-table-wrap">
+      <table class="src-table sug-table">
+        <tr class="head"><td>层</td><td>重量 kg（板+坯）</td><td>水平重心（棚板中心）</td><td>重心高度 mm（累计）</td></tr>
+        ${layerRows}
+      </table>
+    </div>
+    <p class="hint" style="margin:2px 0 0">俯视图已叠加：青色多边形为底层非悬空落点凸包（支撑边界）、蓝色 ◎ 为整架重心水平投影、
+      彩色 ● 为加速度平移后的投影点（绿=稳定 / 黄=临界 / 红=倾覆），箭头表示平移方向与大小。</p>`;
+}
+
+/* 俯视图叠加（两阶段）：支撑多边形在棚板之上、立柱之下；重心/平移点在最上层 */
+function otLegendVisible(visible) {
+  ["otLegend", "otCgLegend", "otShiftLegend"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle("on", visible);
+  });
+}
+
+/* 第一阶段：仅画支撑多边形（棚板之后、立柱之前） */
+function drawOverturnPolygon(ctx, tr) {
+  if (!otData || !otData.evaluable) return;
+  const poly = otData.supportPolygon.vertices;
+  ctx.beginPath();
+  poly.forEach((p, i) => {
+    const x = tr.X(p.x), y = tr.Y(p.y);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.closePath();
+  ctx.fillStyle = "rgba(63,214,214,0.10)";
+  ctx.fill();
+  ctx.strokeStyle = OT_SUPPORT_COLOR;
+  ctx.lineWidth = 1.8;
+  ctx.setLineDash([7, 4]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  // 凸包顶点小方块
+  poly.forEach((p) => {
+    const x = tr.X(p.x), y = tr.Y(p.y);
+    ctx.fillStyle = OT_SUPPORT_COLOR;
+    ctx.fillRect(x - 3, y - 3, 6, 6);
+  });
+}
+
+/* 第二阶段：重心投影、平移箭头与平移点（所有立柱标记之后，最上层） */
+function drawOverturnMarkers(ctx, tr) {
+  otLegendVisible(!!(otData && otData.evaluable));
+  if (!otData || !otData.evaluable) return;
+  const d0 = otData;
+  const cg = d0.centerOfGravity;
+  const sh = d0.shifted;
+  const cx0 = tr.X(cg.x), cy0 = tr.Y(cg.y);
+  const cx1 = tr.X(sh.x), cy1 = tr.Y(sh.y);
+  const col = OT_SHIFT_COLORS[d0.verdict] || "#34c08a";
+
+  // 平移箭头（重心 → 平移点）
+  if (Math.hypot(cx1 - cx0, cy1 - cy0) > 1) {
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(cx0, cy0);
+    ctx.lineTo(cx1, cy1);
+    ctx.stroke();
+    const ang = Math.atan2(cy1 - cy0, cx1 - cx0);
+    ctx.beginPath();
+    ctx.moveTo(cx1, cy1);
+    ctx.lineTo(cx1 - 9 * Math.cos(ang - 0.4), cy1 - 9 * Math.sin(ang - 0.4));
+    ctx.lineTo(cx1 - 9 * Math.cos(ang + 0.4), cy1 - 9 * Math.sin(ang + 0.4));
+    ctx.closePath();
+    ctx.fillStyle = col;
+    ctx.fill();
+  }
+
+  // 重心投影：蓝色双环 ◎
+  ctx.beginPath();
+  ctx.arc(cx0, cy0, 6, 0, Math.PI * 2);
+  ctx.strokeStyle = OT_CG_COLOR;
+  ctx.lineWidth = 1.6;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx0, cy0, 2.2, 0, Math.PI * 2);
+  ctx.fillStyle = OT_CG_COLOR;
+  ctx.fill();
+  ctx.font = "bold 10px sans-serif";
+  ctx.fillStyle = OT_CG_COLOR;
+  ctx.fillText(`重心 (${fmt(cg.x)},${fmt(cg.y)},${fmt(cg.z)})`, cx0 + 9, cy0 - 8);
+
+  // 平移点：彩色实心圆
+  ctx.beginPath();
+  ctx.arc(cx1, cy1, 5.5, 0, Math.PI * 2);
+  ctx.fillStyle = col;
+  ctx.fill();
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  ctx.fillStyle = col;
+  ctx.fillText(`平移点 (${fmt(sh.x)},${fmt(sh.y)})  d=${fmt(d0.signedDistance)} mm`, cx1 + 9, cy1 + 14);
+}
+
+$("#btnOverturn").addEventListener("click", runOverturn);
+["otAx", "otAy"].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("keydown", (e) => { if (e.key === "Enter") runOverturn(); });
+});
+
 /* ================= 画布随窗口缩放重绘 ================= */
 window.addEventListener("resize", debounce(() => { drawTop(); drawSide(); }, 150));
 
@@ -2000,4 +2234,204 @@ function loadShedLocal(rawState) {
   const suggested = alloc.map((ru, i) => (ru === 0 ? w[i] : (wu[i] - ru) / 100));
   const reductions = w.map((wi, i) => wi - suggested[i]);
   return buildResult(true, suggested, reductions, trial, [], null);
+}
+
+/* ======================================================================
+ * 层架抗倾覆试算离线兜底：与 app/calc.py 的 overturning 对齐（只算不存）
+ * 各层累计高度 + 棚板中心求整架重心；底层非悬空落点（重叠合并）凸包为
+ * 支撑多边形；重心投影按 (ax·zcg, ay·zcg) 平移，带符号距离判稳。
+ * ==================================================================== */
+const OT_EPS_MM = 1e-6;
+
+function otNormalize(rawState) {
+  const car = {
+    name: (rawState.car && rawState.car.name) || "窑车台面",
+    w: Math.max(0, num(rawState.car && rawState.car.w)),
+    d: Math.max(0, num(rawState.car && rawState.car.d)),
+  };
+  const layers = (rawState.layers || []).map((l0, idx) => {
+    const b0 = l0.board || {};
+    return {
+      id: l0.id || "L" + idx,
+      name: l0.name || "第" + (idx + 1) + "层",
+      height: Math.max(0, num(l0.height)),
+      board: { x: num(b0.x), y: num(b0.y), w: Math.max(0, num(b0.w)), d: Math.max(0, num(b0.d)), weight: Math.max(0, num(b0.weight)) },
+      wareWeight: Math.max(0, num(l0.wareWeight)),
+      posts: (l0.posts || []).map((p0, j) => ({ id: String(p0.id || "P" + (j + 1)), x: num(p0.x), y: num(p0.y), capacity: num(p0.capacity) })),
+    };
+  });
+  return { car, layers };
+}
+
+/* 距离 ≤ TOL_MM 的落点按连通分组合并（并查集），返回合并后的坐标均值 */
+function otMergeLandings(pts) {
+  const n = pts.length;
+  const parent = Array.from({ length: n }, (_, k) => k);
+  const find = (a) => { while (parent[a] !== a) { parent[a] = parent[parent[a]]; a = parent[a]; } return a; };
+  for (let a = 0; a < n; a++) {
+    for (let b = a + 1; b < n; b++) {
+      if (Math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1]) <= TOL_MM) {
+        parent[find(b)] = find(a);
+      }
+    }
+  }
+  const groups = {};
+  for (let a = 0; a < n; a++) (groups[find(a)] = groups[find(a)] || []).push(a);
+  return Object.values(groups).map((g) => [
+    g.reduce((s, k) => s + pts[k][0], 0) / g.length,
+    g.reduce((s, k) => s + pts[k][1], 0) / g.length,
+  ]);
+}
+
+/* Andrew 单调链凸包（严格凸顶点，剔除共线点），逆时针 */
+function otConvexHull(points) {
+  const pts = Array.from(new Set(points.map((p) => p[0] + "," + p[1])))
+    .map((s) => s.split(",").map(Number))
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  if (pts.length <= 1) return pts;
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower = [];
+  pts.forEach((p) => {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  });
+  const upper = [];
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  return lower.slice(0, -1).concat(upper.slice(0, -1));
+}
+
+function otPolygonArea2(hull) {
+  let s = 0;
+  const m = hull.length;
+  for (let i = 0; i < m; i++) {
+    const a = hull[i], b = hull[(i + 1) % m];
+    s += a[0] * b[1] - b[0] * a[1];
+  }
+  return s;
+}
+
+/* 点到逆时针凸多边形边界的带符号最短距离：内正外负、边上 0 */
+function otSignedDistance(px, py, hull) {
+  let minD = null, outside = false;
+  const m = hull.length;
+  for (let i = 0; i < m; i++) {
+    const [ax, ay] = hull[i], [bx, by] = hull[(i + 1) % m];
+    const ex = bx - ax, ey = by - ay;
+    const len2 = ex * ex + ey * ey;
+    if (len2 <= 1e-18) continue;
+    const cr = ex * (py - ay) - ey * (px - ax);
+    if (cr < -1e-9) outside = true;
+    let t = ((px - ax) * ex + (py - ay) * ey) / len2;
+    t = Math.min(1, Math.max(0, t));
+    const d = Math.hypot(px - (ax + t * ex), py - (ay + t * ey));
+    if (minD === null || d < minD) minD = d;
+  }
+  return minD === null ? 0 : (outside ? -minD : minD);
+}
+
+/* 沿单位方向 (nx,ny) 射线首次到达边界的合加速度 g（与 _ray_exit_tolerance 对齐） */
+function otRayExit(cgX, cgY, cgZ, nx, ny, hull) {
+  if (cgZ <= 1e-12) return null;
+  let best = null;
+  const m = hull.length;
+  for (let i = 0; i < m; i++) {
+    const [ax, ay] = hull[i], [bx, by] = hull[(i + 1) % m];
+    const ex = bx - ax, ey = by - ay;
+    const denom = ex * ny - ey * nx;
+    if (Math.abs(denom) <= 1e-15) continue;
+    const t = (ey * (cgX - ax) - ex * (cgY - ay)) / (cgZ * denom);
+    if (t >= -1e-9 && (best === null || t < best)) best = t;
+  }
+  return best;
+}
+
+function overturningLocal(rawState, axRaw, ayRaw) {
+  const fax = parseFloat(axRaw), fay = parseFloat(ayRaw);
+  if (!Number.isFinite(fax) || !Number.isFinite(fay)) {
+    throw new Error("水平加速度分量 ax / ay 必须是有限数值（单位 g）");
+  }
+  const norm = otNormalize(rawState);
+  const layers = norm.layers;
+  const n = layers.length;
+  const invalid = (reason) => ({
+    ok: true, evaluable: false, reason,
+    accel: { x: fax, y: fay, magnitude: r2(Math.hypot(fax, fay)) },
+    centerOfGravity: null, supportPolygon: null, shifted: null,
+    signedDistance: null, verdict: "unknown", criticalAccel: null,
+    safetyFactor: null, layers: [],
+  });
+  if (n === 0) return invalid("当前架体没有任何层，无法进行抗倾覆评估");
+
+  const supportRect = (i) => i === 0
+    ? { x: 0, y: 0, w: norm.car.w, d: norm.car.d }
+    : { x: layers[i - 1].board.x, y: layers[i - 1].board.y, w: layers[i - 1].board.w, d: layers[i - 1].board.d };
+  const inRect = (x, y, rc) => x >= rc.x && x <= rc.x + rc.w && y >= rc.y && y <= rc.y + rc.d;
+
+  const unsupported = [];
+  const rects = layers.map((_, i) => supportRect(i));
+  layers.forEach((L, i) => {
+    if (!L.posts.some((p) => inRect(p.x, p.y, rects[i]))) unsupported.push(L.name);
+  });
+  if (unsupported.length) {
+    return invalid(unsupported.join("、") +
+      " 没有有效承托（无立柱或立柱全部悬空），载荷不能传到底面，无法按整体刚性架体评估抗倾覆，请先补全各层立柱");
+  }
+
+  let cumH = 0, sw = 0, sx = 0, sy = 0, sz = 0;
+  const rows = [];
+  layers.forEach((L, i) => {
+    cumH += L.height;
+    const b = L.board;
+    const w = b.weight + L.wareWeight;
+    const cx = b.x + b.w / 2, cy = b.y + b.d / 2, cz = cumH;
+    sw += w; sx += w * cx; sy += w * cy; sz += w * cz;
+    rows.push({
+      index: i, name: L.name, weight: r2(w), boardWeight: r2(b.weight),
+      wareWeight: r2(L.wareWeight), cgX: r2(cx), cgY: r2(cy), cgZ: r2(cz),
+    });
+  });
+  if (sw <= 0) return invalid("各层棚板自重与坯件重量合计为 0，整架重心无定义，无法评估抗倾覆");
+
+  const cgX = sx / sw, cgY = sy / sw, cgZ = sz / sw;
+
+  const rawLandings = layers[0].posts
+    .filter((p) => inRect(p.x, p.y, rects[0]))
+    .map((p) => [p.x, p.y]);
+  const landings = otMergeLandings(rawLandings);
+  const hull = otConvexHull(landings);
+  const area2 = hull.length >= 3 ? Math.abs(otPolygonArea2(hull)) : 0;
+  if (area2 <= 1e-9) {
+    return invalid(landings.length < 3
+      ? `底层非悬空立柱落点仅 ${landings.length} 个（已合并重叠落点），全部共线或重合，支撑多边形面积为 0，无法评估抗倾覆；请在底层布置至少 3 个非共线、落在窑车台面内的立柱`
+      : "底层非悬空立柱落点全部共线，支撑多边形面积为 0，无法评估抗倾覆；请错开底层立柱布置使其不共线");
+  }
+
+  const dx = fax * cgZ, dy = fay * cgZ;
+  const shX = cgX + dx, shY = cgY + dy;
+  const dist = otSignedDistance(shX, shY, hull);
+  const verdict = dist > OT_EPS_MM ? "stable" : dist < -OT_EPS_MM ? "overturn" : "critical";
+
+  const mag = Math.hypot(fax, fay);
+  let critical = null, factor = null;
+  if (mag > 0) {
+    const tol = otRayExit(cgX, cgY, cgZ, fax / mag, fay / mag, hull);
+    if (tol !== null) { critical = r2(tol); factor = Math.round(tol / mag * 10000) / 10000; }
+  }
+
+  return {
+    ok: true, evaluable: true, reason: null,
+    accel: { x: fax, y: fay, magnitude: r2(mag) },
+    centerOfGravity: { x: r2(cgX), y: r2(cgY), z: r2(cgZ), weight: r2(sw) },
+    supportPolygon: {
+      vertices: hull.map((p) => ({ x: r2(p[0]), y: r2(p[1]) })),
+      area: r2(area2 / 2), landingCount: landings.length, rawLandingCount: rawLandings.length,
+    },
+    shifted: { x: r2(shX), y: r2(shY), dx: r2(dx), dy: r2(dy) },
+    signedDistance: r2(dist), verdict,
+    criticalAccel: critical, safetyFactor: factor, layers: rows,
+  };
 }
