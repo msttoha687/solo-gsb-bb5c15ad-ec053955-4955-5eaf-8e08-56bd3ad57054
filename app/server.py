@@ -16,6 +16,11 @@ POST /api/load-shed  减载配额试算：body {"state"(可省)}，只下调各�
                      全部有限容量立柱超载的最小总减载量，按现有整架分摊规则约束并
                      重新整架校验；只计算，不写盘；用户确认后由前端走 PUT /api/state
                      把建议坯件重量正式写入
+POST /api/overturn   层架抗倾覆试算：body {"state"(可省), "ax": 0.1, "ay": 0}，
+                     按各层累计高度/棚板中心求整架重心，以底层非悬空立柱落点凸包
+                     为支撑多边形，把重心投影按 (ax, ay)·重心高度平移后计算到凸包
+                     边界的带符号最短距离，判定稳定/临界/倾覆；只计算，不写盘；
+                     落点不足以形成非零面积或任一层无有效承托时返回 evaluable=false
 POST /api/reset      恢复内置示例数据
 """
 
@@ -27,7 +32,7 @@ import tempfile
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from .calc import calculate, load_shed, simulate, suggest_posts
+from .calc import calculate, load_shed, overturn_check, simulate, suggest_posts
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -150,6 +155,22 @@ def api_load_shed():
     if not isinstance(state, dict):
         state = load_state()
     return jsonify({"ok": True, **load_shed(state)})
+
+
+@app.route("/api/overturn", methods=["POST"])
+def api_overturn():
+    """层架抗倾覆试算：重心/支撑凸包/等效偏心带符号距离。只计算，不写盘、不改已保存状态。"""
+    payload = request.get_json(force=True, silent=True)
+    payload = payload if isinstance(payload, dict) else {}
+    state = payload.get("state")
+    if not isinstance(state, dict):
+        state = load_state()
+    # 加速度分量非法（非数字）→ 400；几何条件不足（无承托/凸包退化）属于正常结果 → 200 + evaluable=false
+    try:
+        result = overturn_check(state, payload.get("ax", 0), payload.get("ay", 0))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
 
 
 if __name__ == "__main__":

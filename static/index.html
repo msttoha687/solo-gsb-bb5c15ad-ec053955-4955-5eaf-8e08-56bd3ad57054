@@ -61,6 +61,11 @@
               <span><i class="dot hanging"></i>悬空</span>
               <span><i class="dot failed"></i>失效（推演）</span>
               <span id="suggestLegend" class="suggest-legend"><i class="dot suggest"></i>建议新柱（预览）</span>
+              <span id="overturnLegend" class="overturn-legend">
+                <i class="ot-hull-swatch"></i>支撑边界
+                <i class="ot-cg-swatch"></i>整架重心
+                <i class="ot-proj-swatch stable"></i>投影（稳定/临界/倾覆）
+              </span>
             </div>
           </div>
           <canvas id="topView"></canvas>
@@ -140,6 +145,34 @@
           <button id="btnShed" class="btn btn-run" type="button">开始减载试算</button>
         </div>
         <div id="shedOutput"></div>
+      </div>
+
+      <div class="panel overturn-panel">
+        <div class="sim-head">
+          <h2>📐 层架抗倾覆试算 <span id="overturnStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelOverturn" class="btn btn-ghost" type="button" disabled>✕ 清空试算</button>
+            <button id="btnOverturn" class="btn btn-run" type="button">开始抗倾覆试算</button>
+          </div>
+        </div>
+        <p class="hint">
+          沿用当前编辑的架体：以<b>各层累计高度</b>作为该层棚板与坯件的重心高度、<b>棚板中心</b>
+          作为两者水平重心，按重量求<b>整架重心</b>；取<b>底层非悬空立柱落点的凸包</b>作为支撑多边形。
+          输入水平加速度 x/y 分量（单位 <b>g</b>），重心投影按「加速度 × 重心高度」平移后，计算投影点
+          到支撑边界的<b>带符号最短距离</b>：<b style="color:var(--normal)">正=稳定</b>、
+          <b style="color:var(--warn)">0=临界</b>、<b style="color:var(--error)">负=倾覆</b>。
+          结果同步叠加在俯视图（支撑边界 + 重心/投影点）。试算<span class="hl">只读不写盘</span>；
+          落点不足以形成非零面积、或任一层无有效承托时明确返回无法评估；<b>编辑架体后旧试算立即失效</b>。
+        </p>
+        <div class="overturn-form">
+          <label>水平加速度 ax (g)
+            <input type="number" step="any" id="overturnAx" value="0.1" />
+          </label>
+          <label>水平加速度 ay (g)
+            <input type="number" step="any" id="overturnAy" value="0" />
+          </label>
+        </div>
+        <div id="overturnOutput"></div>
       </div>
 
       <div class="bottom-grid">

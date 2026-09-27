@@ -37,6 +37,16 @@ let shedData = null;           // 最近一次减载试算结果
 let shedSeq = 0;               // 试算请求序号，丢弃过期响应
 let shedAppliedMsg = null;     // 确认减载后的一次性提示
 
+/* ================= 层架抗倾覆试算状态 =================
+ * overturnData 只来自 POST /api/overturn（或离线兜底），只读不写盘；
+ * 编辑架体后立即作废（invalidateOverturn），需要重新试算。
+ */
+let overturnData = null;       // 最近一次抗倾覆试算结果
+let overturnSeq = 0;           // 试算请求序号，丢弃过期响应
+let overturnErr = null;        // 最近一次参数错误提示（400）
+let overturnTimer = null;      // 加速度输入变化后的防抖重算
+const OVERTURN_COLOR = "#46b8e8";
+
 /* ================= 数值/工具 ================= */
 const $ = (sel) => document.querySelector(sel);
 const fmt = (v) => (Math.round(v * 100) / 100).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
@@ -100,6 +110,8 @@ async function recalcAndRender(applyChange) {
     invalidateSuggestions({ silent: true });
     invalidateShed({ silent: true });
   }
+  // 抗倾覆试算只依赖架体几何/重量：加柱、减载确认写入同样会改变它，任何重算都作废
+  invalidateOverturn({ silent: true });
   suggestAppliedMsg = null;
   if (applyChange !== "shed") shedAppliedMsg = null;
   try {
@@ -356,6 +368,7 @@ $("#btnReset").addEventListener("click", async () => {
   failedSelection = []; simulation = null; simDiff = null; simSeq++;
   invalidateSuggestions({ silent: true });
   invalidateShed({ silent: true });
+  invalidateOverturn({ silent: true });
   suggestAppliedMsg = null;
   shedAppliedMsg = null;
   renderEditor(); renderResults(); markLayerBadges();
@@ -381,6 +394,7 @@ function renderResults() {
   renderSuggestOptions();
   renderSuggestPanel();
   renderShedPanel();
+  renderOverturnPanel();
 }
 
 function renderTotals() {
@@ -571,6 +585,7 @@ function drawTop() {
   });
 
   drawSuggestPreview(ctx, tr);
+  drawOverturnOverlay(ctx, tr);
 }
 
 /* 加柱建议预览：在俯视图上叠加建议新柱（金色 ⊕），不改基准数据 */
@@ -1443,6 +1458,266 @@ $("#btnShed").addEventListener("click", runLoadShed);
 $("#btnCancelShed").addEventListener("click", cancelShed);
 $("#btnConfirmShed").addEventListener("click", confirmShed);
 
+/* ================= 层架抗倾覆试算面板 ================= */
+/* 架体发生编辑/重置：上次抗倾覆试算作废（试算只读，不存在确认写入） */
+function invalidateOverturn(opts) {
+  overturnData = null;
+  overturnErr = null;
+  overturnSeq++;
+  clearTimeout(overturnTimer);
+  if (!opts || !opts.silent) {
+    renderOverturnPanel();
+    drawTop();
+  }
+}
+
+function overturnInputs() {
+  const ax = parseFloat($("#overturnAx").value);
+  const ay = parseFloat($("#overturnAy").value);
+  if (!Number.isFinite(ax) || !Number.isFinite(ay)) {
+    throw new Error("水平加速度 x/y 分量必须是有限数值（单位 g，可为负）");
+  }
+  return { ax, ay };
+}
+
+async function runOverturn() {
+  if (!state) return;
+  let ax, ay;
+  try {
+    ({ ax, ay } = overturnInputs());
+  } catch (e) {
+    overturnData = null;
+    overturnErr = e.message;
+    renderOverturnPanel();
+    drawTop();
+    return;
+  }
+  const status = $("#overturnStatus");
+  overturnErr = null;
+  status.textContent = "试算中…";
+  status.className = "badge has-overturn";
+  const seq = ++overturnSeq;
+  let data;
+  try {
+    const res = await fetch("/api/overturn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state, ax, ay }),
+    });
+    data = await res.json().catch(() => null);
+    if (!res.ok) {
+      if (seq !== overturnSeq) return;
+      overturnData = null;
+      overturnErr = (data && data.error) || `试算失败（HTTP ${res.status}）`;
+      renderOverturnPanel();
+      drawTop();
+      return;
+    }
+  } catch (e) {
+    data = overturnLocal(state, ax, ay); // 离线兜底：与后端同一套算法
+  }
+  if (seq !== overturnSeq) return; // 期间已有编辑/重置，丢弃过期响应
+  overturnData = data;
+  renderOverturnPanel();
+  drawTop();
+}
+
+function cancelOverturn() {
+  overturnData = null;
+  overturnErr = null;
+  overturnSeq++;
+  clearTimeout(overturnTimer);
+  renderOverturnPanel();
+  drawTop();
+}
+
+const VERDICT_TEXT = { stable: "稳定", critical: "临界（投影恰在支撑边界）", overturn: "倾覆" };
+const VERDICT_COLOR = { stable: "var(--normal)", critical: "var(--warn)", overturn: "var(--error)" };
+
+function renderOverturnPanel() {
+  const out = $("#overturnOutput");
+  const status = $("#overturnStatus");
+  const btnCancel = $("#btnCancelOverturn");
+  if (!out) return;
+  btnCancel.disabled = !overturnData && !overturnErr;
+
+  if (overturnErr) {
+    status.textContent = "参数有误";
+    status.className = "badge";
+    out.innerHTML = `<p class="ov-reason">⚠ ${escapeHtml(overturnErr)}</p>`;
+    return;
+  }
+  if (!overturnData) {
+    status.textContent = "未试算";
+    status.className = "badge";
+    out.innerHTML = `<p class="muted" style="margin:8px 0 0">填写水平加速度 x/y 分量（单位 g，0=静止）后点击「开始抗倾覆试算」。
+      试算只读取当前架体、不写盘；编辑架体后旧试算立即作废。落点凸包与整架重心/投影点会叠加显示在俯视图。</p>`;
+    return;
+  }
+
+  const d = overturnData;
+  if (!d.evaluable) {
+    status.textContent = "无法评估";
+    status.className = "badge";
+    const layerRows = (d.layers || []).map((L) => `
+      <tr>
+        <td>${escapeHtml(L.name)}</td>
+        <td>${fmt(L.z)}</td>
+        <td>${fmt(L.cx)}, ${fmt(L.cy)}</td>
+        <td>${fmt(L.weight)}</td>
+        <td>${L.supportedCount === 0
+          ? '<span style="color:var(--error)">无有效承托</span>'
+          : `${L.supportedCount} 根有效柱`}</td>
+      </tr>`).join("");
+    out.innerHTML = `
+      <p class="ov-reason">🚫 <b>无法评估：</b>${escapeHtml(d.reason || "架体条件不足")}</p>
+      <div class="ov-table-wrap">
+        <table class="src-table sug-table ov-table">
+          <tr class="head"><td>层</td><td>累计高度 z mm</td><td>棚板中心 (x, y) mm</td><td>重量 kg</td><td>有效承托</td></tr>
+          ${layerRows}
+        </table>
+      </div>`;
+    return;
+  }
+
+  const v = d.verdict;
+  status.textContent = VERDICT_TEXT[v].split("（")[0];
+  status.className = "badge has-overturn " + v;
+  const marginCls = v === "overturn" ? "bad" : v === "critical" ? "warn" : "";
+  const layerRows = d.layers.map((L) => `
+    <tr>
+      <td>${escapeHtml(L.name)}</td>
+      <td>${fmt(L.height)} → <b>${fmt(L.z)}</b></td>
+      <td>${fmt(L.cx)}, ${fmt(L.cy)}</td>
+      <td>${fmt(L.weight)}</td>
+      <td>${L.supportedCount} 根</td>
+    </tr>`).join("");
+  out.innerHTML = `
+    <p class="ov-verdict ${v}">
+      <b>${VERDICT_TEXT[v]}</b>
+      <span class="sub">水平加速度 (${fmt(d.ax)}, ${fmt(d.ay)}) g · 支撑边界判定：投影在
+        ${v === "stable" ? "多边形内，尚有正裕量" : v === "critical" ? "边界上" : "多边形外"}</span>
+    </p>
+    <div class="ov-metrics">
+      <div class="ov-metric"><span>整架总重</span><b>${fmt(d.totalWeight)}</b><small>kg（各层板+坯）</small></div>
+      <div class="ov-metric"><span>整架重心 G</span><b>${fmt(d.cg.x)}, ${fmt(d.cg.y)}</b><small>高度 ${fmt(d.cg.z)} mm</small></div>
+      <div class="ov-metric"><span>等效平移 (ax·Gz, ay·Gz)</span><b>${fmt(d.shift.x)}, ${fmt(d.shift.y)}</b><small>mm</small></div>
+      <div class="ov-metric ${marginCls}"><span>到支撑边界带符号距离</span><b>${fmt(d.margin)}</b><small>mm（正=稳定 / 0=临界 / 负=倾覆）</small></div>
+    </div>
+    <p class="hint" style="margin:2px 0 6px">
+      投影点 <b>(${fmt(d.projection.x)}, ${fmt(d.projection.y)})</b>；
+      底层非悬空立柱落点 ${d.supportPointCount} 个，凸包 ${d.polygon.length} 个顶点。
+      俯视图中蓝色虚线为支撑边界、蓝环为整架重心、彩色点为平移后投影。
+    </p>
+    <div class="ov-table-wrap">
+      <table class="src-table sug-table ov-table">
+        <tr class="head"><td>层</td><td>层高 → 累计高度 z mm</td><td>重心（棚板中心）(x, y) mm</td><td>重量 kg</td><td>有效承托柱</td></tr>
+        ${layerRows}
+      </table>
+    </div>`;
+}
+
+/* 抗倾覆俯视图叠加：支撑凸包（蓝虚线+浅蓝填充）、整架重心（蓝环）、平移投影（判定色） */
+function drawOverturnOverlay(ctx, tr) {
+  const legend = $("#overturnLegend");
+  if (legend) {
+    legend.classList.toggle("on", !!overturnData);
+    const swatch = legend.querySelector(".ot-proj-swatch");
+    if (swatch && overturnData && overturnData.evaluable) {
+      swatch.className = "ot-proj-swatch " + overturnData.verdict;
+    }
+  }
+  if (!overturnData) return;
+  const d = overturnData;
+
+  if (d.evaluable && d.polygon && d.polygon.length >= 3) {
+    // 支撑多边形填充 + 虚线边界
+    ctx.beginPath();
+    d.polygon.forEach((pt, i) => {
+      const x = tr.X(pt.x), y = tr.Y(pt.y);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.closePath();
+    ctx.fillStyle = "rgba(70,184,232,0.10)";
+    ctx.fill();
+    ctx.strokeStyle = OVERTURN_COLOR;
+    ctx.lineWidth = 1.8;
+    ctx.setLineDash([7, 5]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // 顶点（底层非悬空落点）小方点
+    ctx.fillStyle = OVERTURN_COLOR;
+    d.polygon.forEach((pt) => {
+      ctx.fillRect(tr.X(pt.x) - 2.5, tr.Y(pt.y) - 2.5, 5, 5);
+    });
+
+    // 平移向量箭头：重心 → 投影
+    const g = d.cg, p = d.projection;
+    const gx = tr.X(g.x), gy = tr.Y(g.y);
+    const px = tr.X(p.x), py = tr.Y(p.y);
+    if (Math.hypot(px - gx, py - gy) > 4) {
+      ctx.strokeStyle = "rgba(70,184,232,0.85)";
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(gx, gy);
+      ctx.lineTo(px, py);
+      ctx.stroke();
+      const ang = Math.atan2(py - gy, px - gx);
+      ctx.beginPath();
+      ctx.moveTo(px, py);
+      ctx.lineTo(px - 8 * Math.cos(ang - 0.4), py - 8 * Math.sin(ang - 0.4));
+      ctx.moveTo(px, py);
+      ctx.lineTo(px - 8 * Math.cos(ang + 0.4), py - 8 * Math.sin(ang + 0.4));
+      ctx.stroke();
+    }
+
+    // 整架重心：蓝色空心环 + 十字
+    ctx.strokeStyle = OVERTURN_COLOR;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(gx, gy, 7, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(gx - 10, gy); ctx.lineTo(gx - 4, gy);
+    ctx.moveTo(gx + 4, gy); ctx.lineTo(gx + 10, gy);
+    ctx.moveTo(gx, gy - 10); ctx.lineTo(gx, gy - 4);
+    ctx.moveTo(gx, gy + 4); ctx.lineTo(gx, gy + 10);
+    ctx.stroke();
+    ctx.fillStyle = OVERTURN_COLOR;
+    ctx.font = "bold 10px sans-serif";
+    ctx.fillText(`重心 G (${fmt(g.x)},${fmt(g.y)}) z=${fmt(g.z)}`, gx + 10, gy - 9);
+
+    // 平移后投影点：颜色随判定（绿=稳定 / 黄=临界 / 红=倾覆）
+    const vColor = d.verdict === "overturn" ? "#ef5b6b"
+      : d.verdict === "critical" ? "#f0b03c" : "#34c08a";
+    ctx.beginPath();
+    ctx.arc(px, py, 6, 0, Math.PI * 2);
+    ctx.fillStyle = vColor;
+    ctx.fill();
+    ctx.strokeStyle = "#0c1120";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+    ctx.fillStyle = vColor;
+    ctx.font = "bold 10px sans-serif";
+    ctx.fillText(`投影 (${fmt(p.x)},${fmt(p.y)}) d=${fmt(d.margin)} mm`, px + 10, py + 4);
+  }
+}
+
+$("#btnOverturn").addEventListener("click", runOverturn);
+$("#btnCancelOverturn").addEventListener("click", cancelOverturn);
+// 修改加速度分量：已有试算时防抖重算（只重算试算，不触碰架体）；无试算时仅清参数错误提示
+["overturnAx", "overturnAy"].forEach((id) => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener("input", () => {
+    clearTimeout(overturnTimer);
+    overturnTimer = setTimeout(() => {
+      if (overturnData) runOverturn();
+      else if (overturnErr) { overturnErr = null; renderOverturnPanel(); }
+    }, 250);
+  });
+});
+
 /* ================= 画布随窗口缩放重绘 ================= */
 window.addEventListener("resize", debounce(() => { drawTop(); drawSide(); }, 150));
 
@@ -2000,4 +2275,159 @@ function loadShedLocal(rawState) {
   const suggested = alloc.map((ru, i) => (ru === 0 ? w[i] : (wu[i] - ru) / 100));
   const reductions = w.map((wi, i) => wi - suggested[i]);
   return buildResult(true, suggested, reductions, trial, [], null);
+}
+
+/* ======================================================================
+ * 层架抗倾覆试算离线兜底：与 app/calc.py 的 overturn_check 对齐（只读不存）
+ *
+ * 各层棚板+坯件为同一质点（棚板中心，z=累计高度，w=板重+坯重），按重量求整架重心；
+ * 支撑多边形 = 底层非悬空立柱落点的凸包（Andrew 单调链）；投影平移 (ax·Gz, ay·Gz)
+ * 后取到凸包边界的带符号最短距离（内正/边界0/外负），判定稳定/临界/倾覆。
+ * ==================================================================== */
+function overturnLocal(rawState, ax, ay) {
+  if (!Number.isFinite(ax)) throw new Error("水平加速度 x 分量必须是数值（单位 g）");
+  if (!Number.isFinite(ay)) throw new Error("水平加速度 y 分量必须是数值（单位 g）");
+  // 规范化（与 calculateLocal 同样的宽容规则）
+  const car = {
+    name: (rawState.car && rawState.car.name) || "窑车台面",
+    w: Math.max(0, num(rawState.car && rawState.car.w)),
+    d: Math.max(0, num(rawState.car && rawState.car.d)),
+  };
+  const layers = (rawState.layers || []).map((l0, idx) => {
+    const b0 = l0.board || {};
+    return {
+      id: l0.id || "L" + idx,
+      name: l0.name || "第" + (idx + 1) + "层",
+      height: Math.max(0, num(l0.height)),
+      board: { x: num(b0.x), y: num(b0.y), w: Math.max(0, num(b0.w)), d: Math.max(0, num(b0.d)), weight: Math.max(0, num(b0.weight)) },
+      wareWeight: Math.max(0, num(l0.wareWeight)),
+      posts: (l0.posts || []).map((p0, j) => ({ id: String(p0.id || "P" + (j + 1)), x: num(p0.x), y: num(p0.y), capacity: num(p0.capacity) })),
+    };
+  });
+  const n = layers.length;
+  const supportRect = (i) => i === 0
+    ? { x: 0, y: 0, w: car.w, d: car.d }
+    : { x: layers[i - 1].board.x, y: layers[i - 1].board.y, w: layers[i - 1].board.w, d: layers[i - 1].board.d };
+  const inRect = (x, y, rc) => x >= rc.x && x <= rc.x + rc.w && y >= rc.y && y <= rc.y + rc.d;
+  const EPS = 1e-6;
+
+  const layerRows = [];
+  const unsupported = [];
+  let bottomPoints = [];
+  let cumZ = 0, totalWeight = 0, sumX = 0, sumY = 0, sumZ = 0;
+  for (let i = 0; i < n; i++) {
+    const L = layers[i], b = L.board;
+    const rc = supportRect(i);
+    const validPosts = L.posts.filter((p) => inRect(p.x, p.y, rc));
+    if (!validPosts.length) {
+      unsupported.push({ index: i, name: L.name, postCount: L.posts.length, validCount: 0 });
+    }
+    if (i === 0) bottomPoints = validPosts.map((p) => [p.x, p.y, p.id]);
+    const w = b.weight + L.wareWeight;
+    cumZ += L.height;
+    const cx = b.x + b.w / 2, cy = b.y + b.d / 2;
+    totalWeight += w;
+    sumX += w * cx; sumY += w * cy; sumZ += w * cumZ;
+    layerRows.push({
+      index: i, name: L.name, height: r2(L.height), z: r2(cumZ),
+      cx: r2(cx), cy: r2(cy), weight: r2(w), supportedCount: validPosts.length,
+    });
+  }
+
+  const fail = (reason) => ({
+    ok: true, evaluable: false, reason, ax: r2(ax), ay: r2(ay),
+    totalWeight: r2(totalWeight), cg: null, shift: null, projection: null,
+    polygon: null, supportPoints: null, supportPointCount: bottomPoints.length,
+    margin: null, verdict: null, unsupportedLayers: unsupported, layers: layerRows,
+  });
+
+  if (n === 0) return fail("当前架体没有任何层，无法评估抗倾覆稳定性");
+  if (unsupported.length) {
+    const names = unsupported.map((u) =>
+      `${u.name}（录入 ${u.postCount} 根立柱，有效承托 0 根）`).join("、");
+    return fail(`以下 ${unsupported.length} 层无有效承托（立柱均悬空或未录入），整架传力不完整，无法评估抗倾覆：${names}`);
+  }
+
+  // Andrew 单调链凸包（剔除共线点；输入不去精度）
+  const convexHull = (points) => {
+    const pts = [...new Map(points.map(([x, y]) => [x + "|" + y, [x, y]])).values()];
+    pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    if (pts.length <= 2) return pts;
+    const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    const lower = [];
+    pts.forEach((p) => {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+      lower.push(p);
+    });
+    const upper = [];
+    for (let i = pts.length - 1; i >= 0; i--) {
+      const p = pts[i];
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+      upper.push(p);
+    }
+    lower.pop(); upper.pop();
+    return lower.concat(upper);
+  };
+  const area2 = (hull) => {
+    let s = 0;
+    hull.forEach(([x0, y0], i) => {
+      const [x1, y1] = hull[(i + 1) % hull.length];
+      s += x0 * y1 - x1 * y0;
+    });
+    return s;
+  };
+
+  const hullPts = bottomPoints.map(([x, y]) => [x, y]);
+  const uniqueN = new Set(hullPts.map(([x, y]) => x + "|" + y)).size;
+  const hull = convexHull(hullPts);
+  const hullArea = Math.abs(area2(hull)) / 2;
+  if (hull.length < 3 || hullArea <= EPS) {
+    return fail(`底层非悬空立柱落点 ${bottomPoints.length} 个（去重后 ${uniqueN} 个），不足以形成非零面积的支撑多边形（至少需要 3 个不共线落点），无法评估抗倾覆`);
+  }
+  if (totalWeight <= 0) {
+    return fail("整架棚板自重与坯件重量合计为 0，无法按重量求整架重心，不能评估抗倾覆");
+  }
+
+  const gx = sumX / totalWeight, gy = sumY / totalWeight, gz = sumZ / totalWeight;
+  const dx = ax * gz, dy = ay * gz;
+  const px = gx + dx, py = gy + dy;
+
+  // 带符号最短距离：逆时针凸包，点在任一边右侧（叉积<0）即在外
+  let inside = true, best = Infinity;
+  for (let i = 0; i < hull.length; i++) {
+    const [ax0, ay0] = hull[i];
+    const [bx0, by0] = hull[(i + 1) % hull.length];
+    const ex = bx0 - ax0, ey = by0 - ay0;
+    const cr = ex * (py - ay0) - ey * (px - ax0);
+    const el = Math.hypot(ex, ey);
+    if (cr < -EPS * Math.max(1, el)) inside = false;
+    const den = ex * ex + ey * ey;
+    let t = den > 0 ? ((px - ax0) * ex + (py - ay0) * ey) / den : 0;
+    t = Math.max(0, Math.min(1, t));
+    const dd = Math.hypot(px - (ax0 + t * ex), py - (ay0 + t * ey));
+    if (dd < best) best = dd;
+  }
+  const margin = inside ? best : -best;
+  const verdict = margin > EPS ? "stable" : margin < -EPS ? "overturn" : "critical";
+
+  const spMap = new Map();
+  bottomPoints.forEach(([x, y, pid]) => {
+    const key = x + "|" + y;
+    if (!spMap.has(key)) spMap.set(key, { x, y, posts: [] });
+    spMap.get(key).posts.push(pid);
+  });
+  const supportPoints = [...spMap.values()]
+    .sort((a, b) => a.x - b.x || a.y - b.y)
+    .map((q) => ({ x: r2(q.x), y: r2(q.y), posts: q.posts }));
+
+  return {
+    ok: true, evaluable: true, reason: null, ax: r2(ax), ay: r2(ay),
+    totalWeight: r2(totalWeight),
+    cg: { x: r2(gx), y: r2(gy), z: r2(gz) },
+    shift: { x: r2(dx), y: r2(dy) },
+    projection: { x: r2(px), y: r2(py) },
+    polygon: hull.map(([x, y]) => ({ x: r2(x), y: r2(y) })),
+    supportPoints, supportPointCount: bottomPoints.length,
+    margin: r2(margin), verdict, unsupportedLayers: [], layers: layerRows,
+  };
 }

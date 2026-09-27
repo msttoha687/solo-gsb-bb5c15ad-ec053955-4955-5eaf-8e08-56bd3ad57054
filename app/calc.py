@@ -1370,3 +1370,251 @@ def suggest_posts(
         "reason": None,
         "toleranceMm": TOL_MM,
     }
+
+
+# --------------------------------------------------------------------------
+# 层架抗倾覆试算（Overturning Check）
+#
+# 只依赖架体几何与重量（与载荷分摊/容量无关）：
+#   * 第 i 层棚板与坯件视为同一质点：水平位置取棚板中心
+#     (x + w/2, y + d/2)，重心高度取该层*累计高度*
+#     H_i = Σ_{k=0..i} height_k，重量取 board.weight + wareWeight；
+#   * 整架重心 G 为各层质点按重量的加权平均（Gx/Gy/Gz）；
+#   * 支撑多边形取底层（i=0）*非悬空*（底端落在窑车台面矩形内）立柱
+#     落点的凸包，凸包面积必须非零（至少 3 个不共线落点）；
+#   * 水平加速度 (ax, ay)（单位 g）下，重心水平投影平移
+#     (ax·Gz, ay·Gz)（惯性力 m·a，等效偏心 a/g·h，a 以 g 计故系数为 1），
+#     投影点到凸包边界取*带符号最短距离*（内正外负、边界为 0）：
+#       d > 0 稳定（距边界尚有裕量），d ≈ 0 临界（恰在边界上），
+#       d < 0 倾覆（投影越出支撑多边形）。
+# 任一层无有效承托（没有落在承托面内的非悬空立柱）、落点凸包面积为 0、
+# 整架重量为 0 或根本没有层时，明确返回 evaluable=False 与原因，不做判定。
+# --------------------------------------------------------------------------
+OVERTURN_EPS_MM = 1e-6  # 边界临界判定容差（mm）
+
+
+def _convex_hull(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Andrew 单调链凸包；返回逆时针、剔除共线点的顶点列表（输入坐标不去精度）。"""
+    pts = sorted(set(points))
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o: Tuple[float, float], a: Tuple[float, float],
+              b: Tuple[float, float]) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[Tuple[float, float]] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper: List[Tuple[float, float]] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def _polygon_area2(hull: List[Tuple[float, float]]) -> float:
+    """多边形有向面积的 2 倍（鞋带公式）。"""
+    s = 0.0
+    for i, (x0, y0) in enumerate(hull):
+        x1, y1 = hull[(i + 1) % len(hull)]
+        s += x0 * y1 - x1 * y0
+    return s
+
+
+def _signed_distance_to_polygon(
+    x: float, y: float, hull: List[Tuple[float, float]]
+) -> float:
+    """点到凸多边形边界的带符号最短距离：内正、外负、边界 0。
+
+    凸包顶点按逆时针排列：点在所有边的左侧（叉积 ≥ 0）即在内侧；
+    几何最短距离取到各边*线段*（含端点）的最小距离。
+    """
+    inside = True
+    best = math.inf
+    for i, (ax0, ay0) in enumerate(hull):
+        bx0, by0 = hull[(i + 1) % len(hull)]
+        ex, ey = bx0 - ax0, by0 - ay0
+        cross = ex * (y - ay0) - ey * (x - ax0)
+        edge_len = math.hypot(ex, ey)
+        if cross < -OVERTURN_EPS_MM * max(1.0, edge_len):
+            inside = False
+        den = ex * ex + ey * ey
+        t = ((x - ax0) * ex + (y - ay0) * ey) / den if den > 0 else 0.0
+        t = max(0.0, min(1.0, t))
+        d = math.hypot(x - (ax0 + t * ex), y - (ay0 + t * ey))
+        if d < best:
+            best = d
+    return best if inside else -best
+
+
+def overturn_check(
+    raw_state: Optional[Dict[str, Any]], ax: Any, ay: Any
+) -> Dict[str, Any]:
+    """层架抗倾覆试算：整架重心 + 底层落点凸包 + 水平加速度等效偏心。
+
+    参数
+    ----
+    raw_state : 当前架体输入（不被修改、不被持久化）
+    ax, ay    : 水平加速度分量（单位 g，可正可负）；非有限数值抛 ValueError
+
+    返回
+    ----
+    evaluable=True 时给出整架总重、整架重心 cg(x,y,z)、平移量
+    shift=(ax·Gz, ay·Gz)、平移后投影 projection、底层落点凸包 polygon、
+    投影到支撑边界的带符号最短距离 margin(mm) 与判定
+    verdict ∈ {stable, critical, overturn}，以及各层质点明细。
+    evaluable=False 时 reason 说明无法评估的原因（无层 / 有层无有效承托 /
+    落点不足以形成非零面积凸包 / 整架重量为 0）。
+    """
+    try:
+        axv = float(ax)
+    except (TypeError, ValueError):
+        raise ValueError("水平加速度 x 分量必须是数值（单位 g）")
+    try:
+        ayv = float(ay)
+    except (TypeError, ValueError):
+        raise ValueError("水平加速度 y 分量必须是数值（单位 g）")
+    if not math.isfinite(axv):
+        raise ValueError("水平加速度 x 分量必须是有限数值（单位 g）")
+    if not math.isfinite(ayv):
+        raise ValueError("水平加速度 y 分量必须是有限数值（单位 g）")
+
+    norm = normalize(raw_state)
+    layers = norm["layers"]
+    n = len(layers)
+
+    layer_rows: List[Dict[str, Any]] = []
+    unsupported: List[Dict[str, Any]] = []
+    bottom_points: List[Tuple[float, float, str]] = []
+    cum_z = 0.0
+    total_weight = 0.0
+    sum_x = sum_y = sum_z = 0.0
+
+    for i, L in enumerate(layers):
+        rect = _support_rect_for(norm, i)
+        valid_posts = [p for p in L["posts"] if in_rect(p["x"], p["y"], rect)]
+        if not valid_posts:
+            unsupported.append(
+                {
+                    "index": i,
+                    "name": L["name"],
+                    "postCount": len(L["posts"]),
+                    "validCount": 0,
+                }
+            )
+        if i == 0:
+            bottom_points = [(p["x"], p["y"], p["id"]) for p in valid_posts]
+
+        b = L["board"]
+        weight = b["weight"] + L["wareWeight"]
+        cum_z += L["height"]
+        cx = b["x"] + b["w"] / 2.0
+        cy = b["y"] + b["d"] / 2.0
+        total_weight += weight
+        sum_x += weight * cx
+        sum_y += weight * cy
+        sum_z += weight * cum_z
+        layer_rows.append(
+            {
+                "index": i,
+                "name": L["name"],
+                "height": r2(L["height"]),
+                "z": r2(cum_z),
+                "cx": r2(cx),
+                "cy": r2(cy),
+                "weight": r2(weight),
+                "supportedCount": len(valid_posts),
+            }
+        )
+
+    def fail(reason: str) -> Dict[str, Any]:
+        return {
+            "evaluable": False,
+            "reason": reason,
+            "ax": round(axv, 6),
+            "ay": round(ayv, 6),
+            "totalWeight": r2(total_weight),
+            "cg": None,
+            "shift": None,
+            "projection": None,
+            "polygon": None,
+            "supportPoints": None,
+            "supportPointCount": len(bottom_points),
+            "margin": None,
+            "verdict": None,
+            "unsupportedLayers": unsupported,
+            "layers": layer_rows,
+        }
+
+    if n == 0:
+        return fail("当前架体没有任何层，无法评估抗倾覆稳定性")
+
+    if unsupported:
+        names = "、".join(
+            f"{u['name']}（录入 {u['postCount']} 根立柱，有效承托 0 根）"
+            for u in unsupported
+        )
+        return fail(
+            f"以下 {len(unsupported)} 层无有效承托（立柱均悬空或未录入），"
+            f"整架传力不完整，无法评估抗倾覆：{names}"
+        )
+
+    # 底层非悬空立柱落点凸包（坐标完全相同的落点去重）
+    hull_pts = [(x, y) for x, y, _ in bottom_points]
+    unique_n = len(set(hull_pts))
+    hull = _convex_hull(hull_pts)
+    hull_area = abs(_polygon_area2(hull)) / 2.0
+    if len(hull) < 3 or hull_area <= OVERTURN_EPS_MM:
+        return fail(
+            f"底层非悬空立柱落点 {len(bottom_points)} 个（去重后 {unique_n} 个），"
+            "不足以形成非零面积的支撑多边形（至少需要 3 个不共线落点），"
+            "无法评估抗倾覆"
+        )
+
+    if total_weight <= 0.0:
+        return fail(
+            "整架棚板自重与坯件重量合计为 0，无法按重量求整架重心，"
+            "不能评估抗倾覆"
+        )
+
+    gx, gy, gz = sum_x / total_weight, sum_y / total_weight, sum_z / total_weight
+    dx, dy = axv * gz, ayv * gz
+    px, py = gx + dx, gy + dy
+    margin = _signed_distance_to_polygon(px, py, hull)
+    if margin > OVERTURN_EPS_MM:
+        verdict = "stable"
+    elif margin < -OVERTURN_EPS_MM:
+        verdict = "overturn"
+    else:
+        verdict = "critical"
+
+    # 完全重合的落点合并展示（重叠阈值内但非完全重合的点各自保留，凸包不受影响）
+    sp_map: Dict[Tuple[float, float], List[str]] = {}
+    for x, y, pid in bottom_points:
+        sp_map.setdefault((x, y), []).append(pid)
+    support_points = [
+        {"x": r2(x), "y": r2(y), "posts": ids}
+        for (x, y), ids in sorted(sp_map.items())
+    ]
+
+    return {
+        "evaluable": True,
+        "reason": None,
+        "ax": round(axv, 6),
+        "ay": round(ayv, 6),
+        "totalWeight": r2(total_weight),
+        "cg": {"x": r2(gx), "y": r2(gy), "z": r2(gz)},
+        "shift": {"x": r2(dx), "y": r2(dy)},
+        "projection": {"x": r2(px), "y": r2(py)},
+        "polygon": [{"x": r2(x), "y": r2(y)} for x, y in hull],
+        "supportPoints": support_points,
+        "supportPointCount": len(bottom_points),
+        "margin": r2(margin),
+        "verdict": verdict,
+        "unsupportedLayers": [],
+        "layers": layer_rows,
+    }

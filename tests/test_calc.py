@@ -8,7 +8,14 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.calc import calculate, load_shed, normalize, simulate, suggest_posts  # noqa: E402
+from app.calc import (  # noqa: E402
+    calculate,
+    load_shed,
+    normalize,
+    overturn_check,
+    simulate,
+    suggest_posts,
+)
 
 SAMPLE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -793,6 +800,220 @@ class CalcTests(unittest.TestCase):
         before = json.loads(json.dumps(state, ensure_ascii=False))
         load_shed(state)
         self.assertEqual(state, before)
+
+    # ---------------- 层架抗倾覆试算 ----------------
+    def _overturn_rack(self, posts=None, height=300, weight=100, ware=100):
+        posts = (
+            posts
+            if posts is not None
+            else [
+                {"id": "A", "x": 0, "y": 0, "capacity": 0},
+                {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+                {"id": "C", "x": 0, "y": 1000, "capacity": 0},
+                {"id": "D", "x": 1000, "y": 1000, "capacity": 0},
+            ]
+        )
+        return {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "height": height,
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": weight},
+                    "wareWeight": ware,
+                    "posts": posts,
+                }
+            ],
+        }
+
+    def test_overturn_zero_accel_stable_centered(self):
+        r = overturn_check(self._overturn_rack(), 0, 0)
+        self.assertTrue(r["evaluable"])
+        self.assertEqual(r["verdict"], "stable")
+        # 重心在 (500, 500)，到四边（凸包即台面）裕量 500
+        self.assertEqual(r["cg"], {"x": 500.0, "y": 500.0, "z": 300.0})
+        self.assertEqual(r["shift"], {"x": 0.0, "y": 0.0})
+        self.assertEqual(r["projection"], {"x": 500.0, "y": 500.0})
+        self.assertEqual(r["margin"], 500.0)
+        self.assertEqual(r["totalWeight"], 200.0)
+        # 凸包为四角
+        self.assertEqual(
+            {(p["x"], p["y"]) for p in r["polygon"]},
+            {(0.0, 0.0), (1000.0, 0.0), (0.0, 1000.0), (1000.0, 1000.0)},
+        )
+
+    def test_overturn_boundary_is_critical(self):
+        # 重心高 300、x 向距边界 500：ax=500/300 时投影恰在右边界（带符号距离 0）
+        crit = 500.0 / 300.0
+        r = overturn_check(self._overturn_rack(), crit, 0)
+        self.assertEqual(r["verdict"], "critical")
+        self.assertEqual(r["margin"], 0.0)
+        self.assertEqual(r["projection"]["x"], 1000.0)
+        # 略小：稳定（裕量 20）；略大：倾覆（-10）
+        self.assertEqual(overturn_check(self._overturn_rack(), 1.6, 0)["verdict"], "stable")
+        self.assertEqual(overturn_check(self._overturn_rack(), 1.6, 0)["margin"], 20.0)
+        self.assertEqual(overturn_check(self._overturn_rack(), 1.7, 0)["verdict"], "overturn")
+        self.assertEqual(overturn_check(self._overturn_rack(), 1.7, 0)["margin"], -10.0)
+
+    def test_overturn_negative_accel_shifts_opposite_direction(self):
+        r = overturn_check(self._overturn_rack(), -1.6, 0)
+        self.assertEqual(r["projection"]["x"], 20.0)
+        self.assertEqual(r["verdict"], "stable")
+        self.assertEqual(r["margin"], 20.0)
+        r2res = overturn_check(self._overturn_rack(), 0, -1.7)
+        self.assertEqual(r2res["projection"]["y"], -10.0)
+        self.assertEqual(r2res["verdict"], "overturn")
+
+    def test_overturn_multi_layer_weighted_cg_uses_cumulative_height(self):
+        # 两层重量均为 200（板100+坯100），板中心分别为 (500,500) 与 (300,700)，
+        # 层高各 300 → z 为 300、600；整架重心 = 二者均值
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "height": 300,
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "A", "x": 0, "y": 0, "capacity": 0},
+                        {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+                        {"id": "C", "x": 0, "y": 1000, "capacity": 0},
+                        {"id": "D", "x": 1000, "y": 1000, "capacity": 0},
+                    ],
+                },
+                {
+                    "name": "顶",
+                    "height": 300,
+                    "board": {"x": 0, "y": 200, "w": 600, "d": 1000, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "E", "x": 100, "y": 300, "capacity": 0},
+                        {"id": "F", "x": 900, "y": 300, "capacity": 0},
+                        {"id": "G", "x": 100, "y": 900, "capacity": 0},
+                        {"id": "H", "x": 900, "y": 900, "capacity": 0},
+                    ],
+                },
+            ],
+        }
+        r = overturn_check(state, 0, 0)
+        self.assertTrue(r["evaluable"])
+        self.assertEqual(r["cg"]["x"], 400.0)
+        self.assertEqual(r["cg"]["y"], 600.0)
+        self.assertEqual(r["cg"]["z"], 450.0)
+        self.assertEqual(r["totalWeight"], 400.0)
+        self.assertEqual([L["z"] for L in r["layers"]], [300.0, 600.0])
+        # 支撑多边形只取底层四点（与上层立柱无关）
+        self.assertEqual(len(r["polygon"]), 4)
+
+    def test_overturn_inner_support_points_not_hull_vertices(self):
+        # 第五根柱落在台面中央：凸包仍是四角，但它计入 supportPoints
+        posts = [
+            {"id": "A", "x": 0, "y": 0, "capacity": 0},
+            {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+            {"id": "C", "x": 0, "y": 1000, "capacity": 0},
+            {"id": "D", "x": 1000, "y": 1000, "capacity": 0},
+            {"id": "M", "x": 500, "y": 500, "capacity": 0},
+        ]
+        r = overturn_check(self._overturn_rack(posts), 0, 0)
+        self.assertEqual(len(r["polygon"]), 4)
+        self.assertEqual(r["supportPointCount"], 5)
+
+    def test_overturn_hanging_bottom_posts_excluded_from_polygon(self):
+        # 台面 1000x1000；五根柱中一根悬空，有效四点仍成四边形
+        posts = [
+            {"id": "A", "x": 0, "y": 0, "capacity": 0},
+            {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+            {"id": "C", "x": 0, "y": 1000, "capacity": 0},
+            {"id": "D", "x": 1000, "y": 1000, "capacity": 0},
+            {"id": "H", "x": 2000, "y": 2000, "capacity": 0},
+        ]
+        r = overturn_check(self._overturn_rack(posts), 0, 0)
+        self.assertTrue(r["evaluable"])
+        self.assertEqual(r["supportPointCount"], 4)
+
+    def test_overturn_collinear_support_not_evaluable(self):
+        # 三根柱共线 → 凸包面积为 0
+        posts = [
+            {"id": "A", "x": 0, "y": 500, "capacity": 0},
+            {"id": "B", "x": 500, "y": 500, "capacity": 0},
+            {"id": "C", "x": 1000, "y": 500, "capacity": 0},
+        ]
+        r = overturn_check(self._overturn_rack(posts), 0, 0)
+        self.assertFalse(r["evaluable"])
+        self.assertIsNone(r["verdict"])
+        self.assertIn("支撑多边形", r["reason"])
+
+    def test_overturn_too_few_support_points_not_evaluable(self):
+        posts = [
+            {"id": "A", "x": 0, "y": 0, "capacity": 0},
+            {"id": "B", "x": 1000, "y": 1000, "capacity": 0},
+        ]
+        r = overturn_check(self._overturn_rack(posts), 0, 0)
+        self.assertFalse(r["evaluable"])
+        self.assertIn("3 个不共线落点", r["reason"])
+
+    def test_overturn_duplicate_points_dedupe(self):
+        # 三点，其中两点完全重合（落点重叠）：去重后仅 2 个唯一点 → 无法评估
+        posts = [
+            {"id": "A", "x": 0, "y": 0, "capacity": 0},
+            {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+            {"id": "C", "x": 1000, "y": 0, "capacity": 0},
+        ]
+        r = overturn_check(self._overturn_rack(posts), 0, 0)
+        self.assertFalse(r["evaluable"])
+        self.assertEqual(r["supportPointCount"], 3)
+
+    def test_overturn_unsupported_layer_not_evaluable(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        state["layers"][1]["posts"] = []  # 第二层无立柱
+        r = overturn_check(state, 0.1, 0)
+        self.assertFalse(r["evaluable"])
+        self.assertEqual([u["index"] for u in r["unsupportedLayers"]], [1])
+        self.assertIn("无有效承托", r["reason"])
+
+    def test_overturn_all_bottom_posts_hanging_not_evaluable(self):
+        posts = [{"id": "H", "x": 5000, "y": 5000, "capacity": 0}]
+        r = overturn_check(self._overturn_rack(posts), 0, 0)
+        self.assertFalse(r["evaluable"])
+        # 底层无有效承托（全部悬空）优先命中“无有效承托”判定
+        self.assertEqual([u["index"] for u in r["unsupportedLayers"]], [0])
+        self.assertIn("无有效承托", r["reason"])
+
+    def test_overturn_empty_rack_not_evaluable(self):
+        r = overturn_check({"car": {"w": 1000, "d": 1000}, "layers": []}, 0, 0)
+        self.assertFalse(r["evaluable"])
+        self.assertIn("没有任何层", r["reason"])
+
+    def test_overturn_zero_weight_not_evaluable(self):
+        r = overturn_check(self._overturn_rack(weight=0, ware=0), 0, 0)
+        self.assertFalse(r["evaluable"])
+        self.assertIn("合计为 0", r["reason"])
+
+    def test_overturn_invalid_accel_raises(self):
+        state = self._overturn_rack()
+        with self.assertRaises(ValueError):
+            overturn_check(state, "x", 0)
+        with self.assertRaises(ValueError):
+            overturn_check(state, 0, None)
+        with self.assertRaises(ValueError):
+            overturn_check(state, float("inf"), 0)
+        with self.assertRaises(ValueError):
+            overturn_check(state, 0, float("nan"))
+
+    def test_overturn_sample_evaluable_and_does_not_mutate_input(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        before = json.loads(json.dumps(state, ensure_ascii=False))
+        r = overturn_check(state, 0.1, 0)
+        self.assertTrue(r["evaluable"])
+        self.assertIn(r["verdict"], {"stable", "critical", "overturn"})
+        self.assertEqual(state, before)
+        # 静止工况必然稳定（重心在四角凸包内部）
+        r0 = overturn_check(state, 0, 0)
+        self.assertEqual(r0["verdict"], "stable")
+        self.assertGreater(r0["margin"], 0)
 
 
 if __name__ == "__main__":
